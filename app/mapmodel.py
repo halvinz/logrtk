@@ -16,6 +16,7 @@ Deux choses que les logs ne donnent pas directement mais qu'on peut déduire :
 from __future__ import annotations
 
 import re
+import bisect
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -129,9 +130,63 @@ def path_intervals(lines) -> tuple:
     return _merge(station), zone
 
 
+def magnetic_intervals(lines) -> list:
+    """Périodes pendant lesquelles le robot suit la bande magnétique
+    (sortie de base et guidage retour)."""
+    cap = timedelta(seconds=MAX_TRANSIT_SECONDS)
+    out = []
+    open_ts = None
+    for l in lines:
+        if l.ts is None or l.ts.year < MIN_VALID_YEAR:
+            continue
+        low = l.raw.lower()
+        if "magnet" not in low:
+            continue
+        starts = ("magneticstart" in low
+                  or "startfollowstripe" in low
+                  or "setfollowmagneticstate => [true]" in low)
+        stops = ("magneticstop" in low
+                 or "setfollowmagneticstate => [false]" in low
+                 or "magnet_guidance_work_mode change from" in low
+                 and ("--> *stop#" in low or "--> *idle#" in low))
+        if starts and open_ts is None:
+            open_ts = l.ts
+        elif stops and open_ts is not None:
+            out.append((open_ts, min(l.ts, open_ts + cap)))
+            open_ts = None
+    return _merge(out, gap_seconds=10)
+
+
+def station_position(points, lines):
+    """Position réelle de la station de charge : là où se trouve le robot
+    quand il passe en charge / en accostage. L'origine (0,0) de la carte SLAM
+    n'est PAS la station — la supposer donnait un repère au milieu du vide.
+
+    Renvoie (x, y) ou None si les logs ne permettent pas de la situer.
+    """
+    if not points:
+        return None
+    times = [p.ts for p in points]
+    hits = []
+    for l in lines:
+        if l.ts is None or l.ts.year < MIN_VALID_YEAR:
+            continue
+        state = extract_state(l.raw)
+        if state and any(state.startswith(s) for s in ARRIVE_STATES):
+            i = bisect.bisect_left(times, l.ts)
+            if 0 <= i < len(points):
+                hits.append(points[i])
+    if not hits:
+        return None
+    xs = sorted(p.x for p in hits)
+    ys = sorted(p.y for p in hits)
+    return xs[len(xs) // 2], ys[len(ys) // 2]
+
+
 def classify_points(points, station_intervals, zone_intervals,
-                    min_move=0.12) -> list:
-    """0 = tonte, 1 = chemin station, 2 = chemin vers une autre zone.
+                    magnetic=None, min_move=0.12) -> list:
+    """0 = tonte, 1 = chemin station, 2 = chemin vers une autre zone,
+    3 = suivi de la bande magnétique.
 
     Un point n'est classé « chemin » que si le robot bouge réellement à cet
     instant : sinon le robot immobile sur sa base dessinerait un paquet de
@@ -141,10 +196,15 @@ def classify_points(points, station_intervals, zone_intervals,
     n = len(points)
     for i, p in enumerate(points):
         c = 0
-        for a, b in zone_intervals:
+        for a, b in (magnetic or []):
             if a <= p.ts <= b:
-                c = 2
+                c = 3
                 break
+        if c == 0:
+            for a, b in zone_intervals:
+                if a <= p.ts <= b:
+                    c = 2
+                    break
         if c == 0:
             for a, b in station_intervals:
                 if a <= p.ts <= b:

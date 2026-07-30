@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import sys
 import bisect
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from PySide6.QtCore import Qt, QEvent
 from PySide6.QtWidgets import (
@@ -40,7 +40,7 @@ from matplotlib.colors import ListedColormap
 from parser import load_session_from_folder, load_session, RobotSession, TrackPoint
 from logbible import analyze_line
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
-                      extract_state)
+                      extract_state, magnetic_intervals, station_position)
 
 # Fenêtre de regroupement des événements identiques dans l'onglet Diagnostic
 GROUP_SECONDS = 120
@@ -59,6 +59,7 @@ COL_STATION_EDGE = "#111111"
 COL_SELECT = "#d81b60"     # anneau de sélection
 COL_WAY_STATION = "#111111"  # chemin vers la station : traits noirs
 COL_WAY_ZONE = "#7fdc9c"     # chemin vers une autre zone : vert clair
+COL_WAY_MAGNET = "#7e57c2"   # suivi de la bande magnétique : violet
 COL_FORBIDDEN = "#e53935"    # zones interdites (îlots)
 
 
@@ -86,6 +87,8 @@ class TrackCanvas(FigureCanvas):
         self._robot_arrow = None
         self._forbidden = None
         self._forbidden_extent = None
+        self._station = None
+        self._show: dict = {}
         self._analysis_start: datetime | None = None
         self.on_point_clicked = None  # callback(TrackPoint), posé par MainWindow
 
@@ -170,8 +173,11 @@ class TrackCanvas(FigureCanvas):
     def reset_view(self):
         if not self._pts:
             return
-        xs = [p.x for p in self._pts] + [0.0]
-        ys = [p.y for p in self._pts] + [0.0]
+        xs = [p.x for p in self._pts]
+        ys = [p.y for p in self._pts]
+        if self._station is not None:
+            xs.append(self._station[0])
+            ys.append(self._station[1])
         margin_x = max((max(xs) - min(xs)) * 0.08, 1.0)
         margin_y = max((max(ys) - min(ys)) * 0.08, 1.0)
         self.ax.set_xlim(min(xs) - margin_x, max(xs) + margin_x)
@@ -240,16 +246,22 @@ class TrackCanvas(FigureCanvas):
                 alpha=0.35 if pale else 0.75, interpolation="nearest", zorder=3
             )
 
-        for run in self._runs(2):
-            self.ax.plot([p.x for p in run], [p.y for p in run],
-                         color=COL_WAY_ZONE, linewidth=2.6,
-                         alpha=0.4 if pale else 1.0,
-                         solid_capstyle="round", zorder=4)
-        for run in self._runs(1):
-            self.ax.plot([p.x for p in run], [p.y for p in run],
-                         color=COL_WAY_STATION, linewidth=1.8,
-                         linestyle=(0, (5, 3)), alpha=0.4 if pale else 1.0,
-                         zorder=4)
+        a = 0.4 if pale else 1.0
+        if self._show.get("zone", True):
+            for run in self._runs(2):
+                self.ax.plot([p.x for p in run], [p.y for p in run],
+                             color=COL_WAY_ZONE, linewidth=2.6, alpha=a,
+                             solid_capstyle="round", zorder=4)
+        if self._show.get("magnet", True):
+            for run in self._runs(3):
+                self.ax.plot([p.x for p in run], [p.y for p in run],
+                             color=COL_WAY_MAGNET, linewidth=2.6, alpha=a,
+                             solid_capstyle="round", zorder=5)
+        if self._show.get("station", True):
+            for run in self._runs(1):
+                self.ax.plot([p.x for p in run], [p.y for p in run],
+                             color=COL_WAY_STATION, linewidth=1.8,
+                             linestyle=(0, (5, 3)), alpha=a, zorder=4)
 
     def _make_robot_artists(self):
         """Rond du robot + petit triangle de cap posé dessus (odomètre).
@@ -277,26 +289,41 @@ class TrackCanvas(FigureCanvas):
             self._robot_arrow.set_data([p.x], [p.y])
 
     def _draw_station(self):
-        self.ax.plot(0, 0, marker="o", markersize=16, markerfacecolor=COL_STATION,
-                     markeredgecolor=COL_STATION_EDGE, markeredgewidth=2,
-                     linestyle="", zorder=6)
+        if self._station is None:
+            return
+        x, y = self._station
+        self.ax.plot(x, y, marker="o", markersize=17, markerfacecolor=COL_STATION,
+                     markeredgecolor=COL_STATION_EDGE, markeredgewidth=2.2,
+                     linestyle="", zorder=9)
+        self.ax.annotate("⚡", (x, y), ha="center", va="center",
+                         fontsize=9, zorder=10)
 
     def _legend(self, analysis: bool):
         handles = [
             Line2D([], [], marker="o", linestyle="", color=COL_ZONE,
                    label="Zone tondue"),
-            Line2D([], [], color=COL_WAY_STATION, linestyle=(0, (5, 3)),
-                   linewidth=1.8, label="Chemin vers la station"),
-            Line2D([], [], color=COL_WAY_ZONE, linewidth=2.6,
-                   label="Chemin vers une autre zone"),
-            Line2D([], [], marker="s", linestyle="", color=COL_FORBIDDEN,
-                   alpha=0.75, label="Zone interdite / obstacle"),
-            Line2D([], [], marker="o", linestyle="", markerfacecolor=COL_STATION,
-                   markeredgecolor=COL_STATION_EDGE, color=COL_STATION,
-                   label="Station de charge"),
-            Line2D([], [], marker="o", linestyle="", color=COL_ROBOT,
-                   label="Robot (flèche = sens d'avancement)"),
         ]
+        if self._show.get("station", True) and self._runs(1):
+            handles.append(Line2D([], [], color=COL_WAY_STATION,
+                                  linestyle=(0, (5, 3)), linewidth=1.8,
+                                  label="Chemin vers la station"))
+        if self._show.get("magnet", True) and self._runs(3):
+            handles.append(Line2D([], [], color=COL_WAY_MAGNET, linewidth=2.6,
+                                  label="Suivi bande magnétique"))
+        if self._show.get("zone", True) and self._runs(2):
+            handles.append(Line2D([], [], color=COL_WAY_ZONE, linewidth=2.6,
+                                  label="Chemin vers une autre zone"))
+        if self._forbidden is not None:
+            handles.append(Line2D([], [], marker="s", linestyle="",
+                                  color=COL_FORBIDDEN, alpha=0.75,
+                                  label="Zone interdite / obstacle"))
+        if self._station is not None:
+            handles.append(Line2D([], [], marker="o", linestyle="",
+                                  markerfacecolor=COL_STATION,
+                                  markeredgecolor=COL_STATION_EDGE,
+                                  color=COL_STATION, label="Station de charge"))
+        handles.append(Line2D([], [], marker="o", linestyle="", color=COL_ROBOT,
+                              label="Robot (flèche = sens d'avancement)"))
         if analysis:
             handles.append(Line2D([], [], color=COL_PATH, linewidth=2,
                                   label="Chemin parcouru"))
@@ -313,13 +340,17 @@ class TrackCanvas(FigureCanvas):
     # ------------------------------------------------------------------
     def plot_track(self, points: list[TrackPoint], filter_outliers: bool = True,
                    station_intervals=None, zone_intervals=None,
-                   show_forbidden: bool = True):
+                   magnetic_intervals=None, station_xy=None,
+                   show_forbidden: bool = True, show=None):
         self._reset_axes()
         self._analysis_start = None
+        self._show = show or {}
+        self._station = station_xy
         self._pts = self._filter_points(points, filter_outliers)
         self._ts = [p.ts for p in self._pts]
         self._cats = classify_points(self._pts, station_intervals or [],
-                                     zone_intervals or [])
+                                     zone_intervals or [],
+                                     magnetic=magnetic_intervals or [])
         if show_forbidden and self._pts:
             self._forbidden, self._forbidden_extent = forbidden_zones(
                 [p.x for p in self._pts], [p.y for p in self._pts]
@@ -404,6 +435,8 @@ class MainWindow(QMainWindow):
         self.analysis_time: datetime | None = None   # curseur du mode Show time path
         self._station_intervals: list = []            # trajets vers/depuis la station
         self._zone_intervals: list = []               # transferts vers une autre zone
+        self._magnetic_intervals: list = []           # suivi de la bande magnétique
+        self._station_xy = None                       # position réelle de la station
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -423,6 +456,11 @@ class MainWindow(QMainWindow):
 
         # --- Filtre temporel ---
         filter_bar = QHBoxLayout()
+        filter_bar.addWidget(QLabel("Jour :"))
+        self.combo_day = QComboBox()
+        self.combo_day.addItem("Toute la période")
+        self.combo_day.currentIndexChanged.connect(self.on_day_changed)
+        filter_bar.addWidget(self.combo_day)
         filter_bar.addWidget(QLabel("Début :"))
         self.dt_start = QDateTimeEdit()
         self.dt_start.setCalendarPopup(True)
@@ -434,15 +472,26 @@ class MainWindow(QMainWindow):
         self.chk_outliers = QCheckBox("Filtrer les points aberrants")
         self.chk_outliers.setChecked(True)
         filter_bar.addWidget(self.chk_outliers)
-        self.chk_forbidden = QCheckBox("Zones interdites")
-        self.chk_forbidden.setChecked(True)
-        self.chk_forbidden.stateChanged.connect(self.refresh_track)
-        filter_bar.addWidget(self.chk_forbidden)
         self.btn_apply = QPushButton("Appliquer le filtre")
         self.btn_apply.clicked.connect(self.refresh_view)
         filter_bar.addWidget(self.btn_apply)
         filter_bar.addStretch(1)
         root.addLayout(filter_bar)
+
+        # --- Couches affichées sur la carte ---
+        layer_bar = QHBoxLayout()
+        layer_bar.addWidget(QLabel("Afficher :"))
+        self.chk_forbidden = QCheckBox("Zones interdites")
+        self.chk_way_station = QCheckBox("Chemin station")
+        self.chk_way_magnet = QCheckBox("Bande magnétique")
+        self.chk_way_zone = QCheckBox("Chemin entre zones")
+        for chk in (self.chk_forbidden, self.chk_way_station,
+                    self.chk_way_magnet, self.chk_way_zone):
+            chk.setChecked(True)
+            chk.stateChanged.connect(self.refresh_track)
+            layer_bar.addWidget(chk)
+        layer_bar.addStretch(1)
+        root.addLayout(layer_bar)
 
         # --- Zone principale : splitter (carte | infos+logs) ---
         splitter = QSplitter(Qt.Horizontal)
@@ -769,6 +818,17 @@ class MainWindow(QMainWindow):
             self.btn_timepath.setChecked(False)
 
         self._station_intervals, self._zone_intervals = path_intervals(s.lines)
+        self._magnetic_intervals = magnetic_intervals(s.lines)
+        self._station_xy = station_position(s.track, s.lines)
+
+        # Liste des journées présentes dans la trace
+        days = sorted({p.ts.date() for p in s.track if p.ts.year >= 2020})
+        self.combo_day.blockSignals(True)
+        self.combo_day.clear()
+        self.combo_day.addItem("Toute la période")
+        for d in days:
+            self.combo_day.addItem(d.strftime("%d/%m/%Y"), d)
+        self.combo_day.blockSignals(False)
 
         self.statusBar().showMessage(
             f"{len(s.track)} points de position — {len(s.lines)} lignes de log."
@@ -779,6 +839,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Rafraîchissement
     # ------------------------------------------------------------------
+    def on_day_changed(self, index: int):
+        """Choix d'une journée : cale les bornes sur ce jour-là pour ne voir
+        que ce que le robot a tondu ce jour, ou revient à toute la période."""
+        if not self.session:
+            return
+        day = self.combo_day.itemData(index)
+        if day is None:
+            valid = [p.ts for p in self.session.track if p.ts.year >= 2020]
+            if valid:
+                self.dt_start.setDateTime(min(valid))
+                self.dt_end.setDateTime(max(valid))
+        else:
+            self.dt_start.setDateTime(datetime.combine(day, time.min))
+            self.dt_end.setDateTime(datetime.combine(day, time.max))
+        self.refresh_view()
+
     def refresh_view(self):
         self.refresh_track()
         self.refresh_log_list()
@@ -881,7 +957,14 @@ class MainWindow(QMainWindow):
             filter_outliers=self.chk_outliers.isChecked(),
             station_intervals=self._station_intervals,
             zone_intervals=self._zone_intervals,
+            magnetic_intervals=self._magnetic_intervals,
+            station_xy=self._station_xy,
             show_forbidden=self.chk_forbidden.isChecked(),
+            show={
+                "station": self.chk_way_station.isChecked(),
+                "magnet": self.chk_way_magnet.isChecked(),
+                "zone": self.chk_way_zone.isChecked(),
+            },
         )
 
     def refresh_log_list(self):
