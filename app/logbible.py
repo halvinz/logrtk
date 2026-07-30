@@ -85,6 +85,7 @@ _RE_WHEEL = re.compile(r"wheel motor fault\D*(\d+)", re.I)
 _RE_BLADE_H = re.compile(r"getBladeHeight\D*(\d+)", re.I)
 _RE_MAGNET_VAL = re.compile(r"magnetic info\D*(-?\d+)", re.I)
 _RE_BUTTON = re.compile(r"button pressed is\W*(\d+)", re.I)
+_RE_LEVEL = re.compile(r"level\D*(-?\d+)", re.I)
 
 
 def _r(category, severity, meaning, conclusion=""):
@@ -198,6 +199,18 @@ def analyze_line(raw: str) -> Optional[dict]:
     if "err_rtk_float" in low:
         return _r("Signal RTK", "error", "Perte de signal RTK",
                   "Vérifier antenne/ciel dégagé ; possible coupure 4G (Level < 15000 hors station)")
+
+    if "task monitor" in low:
+        m = _RE_LEVEL.search(low)
+        if m and int(m.group(1)) < 15000:
+            return _r("Signal 4G", "warn",
+                      f"Signal 4G faible (Level {m.group(1)} < 15000)",
+                      "Hors station de charge : risque de coupure RTK suite à la perte 4G")
+        return None  # niveau correct : rien à signaler
+
+    if "slip" in low:
+        return _r("Odomètre", "warn", "Patinage détecté (roues qui glissent)",
+                  "Sol glissant, pente ou herbe humide — vérifier l'endroit sur la carte")
 
     if "button pressed is" in low:
         m = _RE_BUTTON.search(raw)

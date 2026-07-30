@@ -15,7 +15,9 @@ gui.py — Interface principale : Robot Log Viewer
 from __future__ import annotations
 
 import os
+import re
 import sys
+import math
 import bisect
 import statistics
 from datetime import datetime, timedelta
@@ -48,6 +50,8 @@ COL_PATH = "#1565c0"       # chemin parcouru en mode analyse
 COL_ROBOT = "#111111"      # position du robot
 COL_STATION_EDGE = "#111111"
 COL_SELECT = "#d81b60"     # anneau de sélection
+COL_WAY = "#8d8d8d"        # chemins (trajets station <-> zones)
+COL_WAY_PALE = "#d8d8d8"
 
 
 class TrackCanvas(FigureCanvas):
@@ -67,9 +71,11 @@ class TrackCanvas(FigureCanvas):
 
         self._pts: list[TrackPoint] = []
         self._ts: list[datetime] = []
+        self._transit: list[bool] = []
         self._sel_marker = None
         self._trail = None
         self._robot_marker = None
+        self._robot_arrow = None
         self._analysis_start: datetime | None = None
         self.on_point_clicked = None  # callback(TrackPoint), posé par MainWindow
 
@@ -95,6 +101,7 @@ class TrackCanvas(FigureCanvas):
         self._sel_marker = None
         self._trail = None
         self._robot_marker = None
+        self._robot_arrow = None
 
     # ------------------------------------------------------------------
     # Interactions souris
@@ -171,10 +178,41 @@ class TrackCanvas(FigureCanvas):
         return pts
 
     def _draw_zone(self, pale: bool):
-        xs = [p.x for p in self._pts]
-        ys = [p.y for p in self._pts]
-        color = COL_ZONE_PALE if pale else COL_ZONE
-        self.ax.scatter(xs, ys, color=color, s=14, linewidths=0, zorder=1)
+        """Zone tondue en vert + chemins (trajets station <-> zones) en gris."""
+        zone = [p for p, t in zip(self._pts, self._transit) if not t]
+        ways = [p for p, t in zip(self._pts, self._transit) if t]
+        if zone:
+            self.ax.scatter([p.x for p in zone], [p.y for p in zone],
+                            color=COL_ZONE_PALE if pale else COL_ZONE,
+                            s=14, linewidths=0, zorder=1)
+        if ways:
+            self.ax.scatter([p.x for p in ways], [p.y for p in ways],
+                            color=COL_WAY_PALE if pale else COL_WAY,
+                            s=7, linewidths=0, zorder=2)
+
+    def _make_robot_artists(self):
+        """Crée le rond du robot + sa flèche de sens d'avancement (odomètre)."""
+        (self._robot_marker,) = self.ax.plot(
+            [], [], marker="o", markersize=11, markerfacecolor=COL_ROBOT,
+            markeredgecolor="white", markeredgewidth=1.5, linestyle="", zorder=6
+        )
+        self._robot_arrow = self.ax.quiver(
+            [0.0], [0.0], [0.0], [0.0], angles="xy", scale_units="xy", scale=1,
+            color=COL_ROBOT, width=0.006, zorder=8
+        )
+
+    def _update_robot(self, p: TrackPoint):
+        """Place le robot en `p` avec la flèche orientée selon son cap."""
+        if self._robot_marker is None:
+            return
+        self._robot_marker.set_data([p.x], [p.y])
+        if self._robot_arrow is not None:
+            xlim = self.ax.get_xlim()
+            length = (xlim[1] - xlim[0]) * 0.05
+            rad = math.radians(p.heading)
+            self._robot_arrow.set_offsets([[p.x, p.y]])
+            self._robot_arrow.set_UVC([length * math.cos(rad)],
+                                      [length * math.sin(rad)])
 
     def _draw_station(self):
         self.ax.plot(0, 0, marker="o", markersize=13, markerfacecolor="white",
@@ -187,11 +225,15 @@ class TrackCanvas(FigureCanvas):
         handles = [
             Line2D([], [], marker="o", linestyle="", color=COL_ZONE,
                    label="Zone tondue"),
+            Line2D([], [], marker="o", linestyle="", color=COL_WAY,
+                   label="Chemins (station ↔ zones)"),
             Line2D([], [], marker="o", linestyle="", markerfacecolor="white",
                    markeredgecolor=COL_STATION_EDGE, color="white",
                    label="Station de charge"),
             Line2D([], [], marker="o", linestyle="", color=COL_ROBOT,
                    label="Robot"),
+            Line2D([], [], marker=">", linestyle="", color=COL_ROBOT,
+                   label="Flèche = sens d'avancement"),
         ]
         if analysis:
             handles.append(Line2D([], [], color=COL_PATH, linewidth=2,
@@ -207,28 +249,31 @@ class TrackCanvas(FigureCanvas):
     # ------------------------------------------------------------------
     # Vue normale : zone tondue + station + dernière position du robot
     # ------------------------------------------------------------------
-    def plot_track(self, points: list[TrackPoint], filter_outliers: bool = True):
+    def plot_track(self, points: list[TrackPoint], filter_outliers: bool = True,
+                   transit_intervals: list | None = None):
         self._reset_axes()
         self._analysis_start = None
         self._pts = self._filter_points(points, filter_outliers)
         self._ts = [p.ts for p in self._pts]
+        intervals = transit_intervals or []
+        self._transit = [
+            any(a <= p.ts < b for a, b in intervals) for p in self._pts
+        ]
         if not self._pts:
             self.draw()
             return
 
         self._draw_zone(pale=False)
         self._draw_station()
-        last = self._pts[-1]
-        self.ax.plot(last.x, last.y, marker="o", markersize=10,
-                     markerfacecolor=COL_ROBOT, markeredgecolor="white",
-                     markeredgewidth=1.5, linestyle="", zorder=6)
         (self._sel_marker,) = self.ax.plot(
             [], [], marker="o", markersize=14, markerfacecolor="none",
             markeredgecolor=COL_SELECT, markeredgewidth=2.5, linestyle="",
             zorder=7
         )
+        self._make_robot_artists()
         self._legend(analysis=False)
         self.reset_view()
+        self._update_robot(self._pts[-1])
         self.draw()
 
     def select_time(self, ts: datetime) -> TrackPoint | None:
@@ -255,10 +300,7 @@ class TrackCanvas(FigureCanvas):
         self._draw_station()
         (self._trail,) = self.ax.plot([], [], color=COL_PATH, linewidth=2.5,
                                       solid_capstyle="round", zorder=5)
-        (self._robot_marker,) = self.ax.plot(
-            [], [], marker="o", markersize=11, markerfacecolor=COL_ROBOT,
-            markeredgecolor="white", markeredgewidth=1.5, linestyle="", zorder=6
-        )
+        self._make_robot_artists()
         self._legend(analysis=True)
         self.ax.set_xlim(xlim)
         self.ax.set_ylim(ylim)
@@ -279,7 +321,7 @@ class TrackCanvas(FigureCanvas):
             # pas encore de position depuis le départ : robot au point le plus proche
             self._trail.set_data([], [])
             current = min(self._pts, key=lambda p: abs((p.ts - ts).total_seconds()))
-        self._robot_marker.set_data([current.x], [current.y])
+        self._update_robot(current)
         self.draw_idle()
         return current
 
@@ -293,6 +335,7 @@ class MainWindow(QMainWindow):
         self.session: RobotSession | None = None
         self.analysis_start: datetime | None = None  # moment choisi (clic carte / log)
         self.analysis_time: datetime | None = None   # curseur du mode Show time path
+        self._transit_intervals: list = []           # périodes LeaveBase/Return (chemins)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -653,6 +696,8 @@ class MainWindow(QMainWindow):
         if self.btn_timepath.isChecked():
             self.btn_timepath.setChecked(False)
 
+        self._transit_intervals = self._compute_transit_intervals()
+
         self.statusBar().showMessage(
             f"{len(s.track)} points de position — {len(s.lines)} lignes de log."
         )
@@ -743,13 +788,43 @@ class MainWindow(QMainWindow):
             "« Show time path » pour rejouer le comportement."
         )
 
+    def _compute_transit_intervals(self) -> list:
+        """Périodes où le robot est en déplacement station <-> zones,
+        déduites des états LeaveBase / Return des logs : ces portions de
+        trace sont dessinées en gris (chemins) au lieu du vert (tonte)."""
+        if not self.session:
+            return []
+        state_re = re.compile(r"Ui_inter_WorkMode_?\s*(\w+)", re.I)
+        changes = []
+        for l in self.session.lines:
+            if l.ts is None or "ui_inter_workmode" not in l.raw.lower():
+                continue
+            m = state_re.search(l.raw)
+            if m:
+                changes.append((l.ts, m.group(1).lower()))
+        changes.sort(key=lambda c: c[0])
+
+        intervals = []
+        current_start = None
+        for ts, state in changes:
+            in_transit = state.startswith("leavebase") or state.startswith("return")
+            if in_transit and current_start is None:
+                current_start = ts
+            elif not in_transit and current_start is not None:
+                intervals.append((current_start, ts))
+                current_start = None
+        if current_start is not None:
+            intervals.append((current_start, datetime.max))
+        return intervals
+
     def refresh_track(self):
         if not self.session:
             return
         start = self.dt_start.dateTime().toPython()
         end = self.dt_end.dateTime().toPython()
         pts = [p for p in self.session.track if start <= p.ts <= end]
-        self.canvas.plot_track(pts, filter_outliers=self.chk_outliers.isChecked())
+        self.canvas.plot_track(pts, filter_outliers=self.chk_outliers.isChecked(),
+                               transit_intervals=self._transit_intervals)
 
     def refresh_log_list(self):
         if not self.session:
