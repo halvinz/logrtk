@@ -221,43 +221,68 @@ def classify_points(points, station_intervals, zone_intervals,
     return cats
 
 
-def forbidden_zones(xs, ys, max_grid=260):
-    """Détecte les poches jamais visitées mais entourées de zone tondue :
-    ce sont les zones interdites / obstacles (îlots).
+class Grid:
+    """Quadrillage du terrain, partagé par toutes les couches de la carte
+    pour qu'elles se superposent exactement."""
 
-    Renvoie (masque_bool, extent) prêt pour imshow, ou (None, None).
-    """
-    if len(xs) < 200:
-        return None, None
+    def __init__(self, x0, y0, cell, nx, ny):
+        self.x0, self.y0, self.cell, self.nx, self.ny = x0, y0, cell, nx, ny
+        # imshow répartit nx cases sur [left, right] : on cale les bords pour
+        # que le centre de la case j retombe sur x0 + (j-1) * cell.
+        self.extent = (x0 - 1.5 * cell, x0 + (nx - 1.5) * cell,
+                       y0 - 1.5 * cell, y0 + (ny - 1.5) * cell)
 
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    x0, x1 = float(xs.min()), float(xs.max())
-    y0, y1 = float(ys.min()), float(ys.max())
+
+def build_grid(xs, ys, max_grid=260, min_cell=0.35):
+    """Quadrillage couvrant tout le terrain. La taille de case ne descend pas
+    sous ~35 cm : c'est la largeur du robot, en dessous les passages voisins
+    ne se rejoindraient plus et la pelouse apparaîtrait pleine de trous."""
+    if len(xs) < 50:
+        return None
+    x0, x1 = float(min(xs)), float(max(xs))
+    y0, y1 = float(min(ys)), float(max(ys))
     span = max(x1 - x0, y1 - y0)
     if span <= 0:
-        return None, None
-
-    cell = max(span / max_grid, 0.35)          # ~35 cm minimum
+        return None
+    cell = max(span / max_grid, min_cell)
     nx = int((x1 - x0) / cell) + 3
     ny = int((y1 - y0) / cell) + 3
     if nx < 8 or ny < 8:
-        return None, None
+        return None
+    return Grid(x0, y0, cell, nx, ny)
 
-    visited = np.zeros((ny, nx), dtype=bool)
-    ix = ((xs - x0) / cell).astype(int) + 1
-    iy = ((ys - y0) / cell).astype(int) + 1
-    visited[iy, ix] = True
 
-    # le robot fait ~25 cm de large : on épaissit d'une case pour boucher
-    # les interstices entre deux passages parallèles
-    grown = visited.copy()
-    grown[1:, :] |= visited[:-1, :]
-    grown[:-1, :] |= visited[1:, :]
-    grown[:, 1:] |= visited[:, :-1]
-    grown[:, :-1] |= visited[:, 1:]
+def rasterize(xs, ys, grid: Grid, dilate: bool = True):
+    """Cases du quadrillage parcourues par le robot, épaissies d'une case
+    (largeur de la machine) pour obtenir une surface pleine."""
+    mask = np.zeros((grid.ny, grid.nx), dtype=bool)
+    if len(xs) == 0:
+        return mask
+    ix = ((np.asarray(xs, dtype=float) - grid.x0) / grid.cell).astype(int) + 1
+    iy = ((np.asarray(ys, dtype=float) - grid.y0) / grid.cell).astype(int) + 1
+    ok = (ix >= 0) & (ix < grid.nx) & (iy >= 0) & (iy < grid.ny)
+    mask[iy[ok], ix[ok]] = True
+    if not dilate:
+        return mask
+    grown = mask.copy()
+    grown[1:, :] |= mask[:-1, :]
+    grown[:-1, :] |= mask[1:, :]
+    grown[:, 1:] |= mask[:, :-1]
+    grown[:, :-1] |= mask[:, 1:]
+    return grown
 
-    free = ~grown
+
+def forbidden_zones(covered, grid: Grid, min_area_m2=2.0):
+    """Poches jamais visitées mais entourées de pelouse : ce sont les zones
+    interdites / obstacles (les « island » des logs).
+
+    `covered` est le masque de la surface parcourue sur tout l'historique.
+    Renvoie un masque booléen, ou None s'il n'y a rien de significatif.
+    """
+    if covered is None or grid is None:
+        return None
+    ny, nx = covered.shape
+    free = ~covered
     outside = np.zeros_like(free)
     q = deque()
     for i in range(ny):
@@ -280,18 +305,13 @@ def forbidden_zones(xs, ys, max_grid=260):
 
     holes = free & ~outside
     if holes.sum() < 6:      # rien de significatif
-        return None, None
+        return None
 
-    # supprime les micro-trous (bruit de position) : garde les poches >= 5 cases
-    labelled = _drop_small(holes, min_size=5)
-    if labelled is None:
-        return None, None
-
-    # imshow répartit nx cases sur [left, right] : on cale les bords pour que
-    # le centre de la case j retombe exactement sur x0 + (j-1) * cell.
-    extent = (x0 - 1.5 * cell, x0 + (nx - 1.5) * cell,
-              y0 - 1.5 * cell, y0 + (ny - 1.5) * cell)
-    return labelled, extent
+    # Une vraie zone interdite (arbre, massif, bassin) fait au moins ~2 m² ;
+    # en dessous c'est un simple coin oublié par la tondeuse, et l'afficher
+    # en rouge brouillerait la lecture de la carte.
+    min_size = max(5, int(min_area_m2 / (grid.cell * grid.cell)))
+    return _drop_small(holes, min_size=min_size)
 
 
 def _drop_small(mask, min_size):

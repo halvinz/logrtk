@@ -40,7 +40,8 @@ from matplotlib.colors import ListedColormap
 from parser import load_session_from_folder, load_session, RobotSession, TrackPoint
 from logbible import analyze_line, normalize, search_terms, SEARCH_CATALOG
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
-                      extract_state, magnetic_intervals, station_position)
+                      extract_state, magnetic_intervals, station_position,
+                      build_grid, rasterize)
 
 # Fenêtre de regroupement des événements identiques dans l'onglet Diagnostic
 GROUP_SECONDS = 120
@@ -50,8 +51,10 @@ APP_TITLE = "Robot Log Viewer"
 
 # Palette "appli officielle" : fond clair, zone tondue verte
 COL_BG = "#f4f4f1"
-COL_ZONE = "#28a95c"       # vert plein de la zone tondue
-COL_ZONE_PALE = "#c4e9d2"  # même zone, estompée (mode analyse)
+COL_ZONE = "#1f9e4f"       # tondu sur la période affichée : vert franc
+COL_LAWN = "#bfe6ce"       # pelouse entière (tout l'historique) : vert pâle
+COL_ZONE_PALE = "#d7efe0"  # les deux estompés en mode analyse
+COL_LAWN_PALE = "#ecf6f0"
 COL_PATH = "#1565c0"       # chemin parcouru en mode analyse
 COL_ROBOT = "#111111"      # position du robot
 COL_STATION = "#ffd400"    # station de charge (jaune)
@@ -86,7 +89,10 @@ class TrackCanvas(FigureCanvas):
         self._robot_marker = None
         self._robot_arrow = None
         self._forbidden = None
-        self._forbidden_extent = None
+        self._grid = None
+        self._lawn_mask = None
+        self._mowed_mask = None
+        self._view_pts: list[TrackPoint] = []
         self._station = None
         self._show: dict = {}
         self._analysis_start: datetime | None = None
@@ -171,10 +177,11 @@ class TrackCanvas(FigureCanvas):
         self.on_point_clicked(nearest)
 
     def reset_view(self):
-        if not self._pts:
+        pts = self._view_pts or self._pts
+        if not pts:
             return
-        xs = [p.x for p in self._pts]
-        ys = [p.y for p in self._pts]
+        xs = [p.x for p in pts]
+        ys = [p.y for p in pts]
         if self._station is not None:
             xs.append(self._station[0])
             ys.append(self._station[1])
@@ -227,24 +234,32 @@ class TrackCanvas(FigureCanvas):
             runs.append(cur)
         return [r for r in runs if len(r) >= 2]
 
+    def _fill(self, mask, color, alpha, zorder):
+        """Peint les cases d'un masque du quadrillage."""
+        if mask is None or self._grid is None or not mask.any():
+            return
+        self.ax.imshow(
+            np.ma.masked_where(~mask, mask.astype(float)),
+            extent=self._grid.extent, origin="lower", aspect="auto",
+            cmap=ListedColormap([color]), alpha=alpha,
+            interpolation="nearest", zorder=zorder,
+        )
+
     def _draw_zone(self, pale: bool):
-        """Zone tondue (vert), chemins station (traits noirs), chemins vers une
-        autre zone (vert clair), zones interdites (rouge)."""
-        mowed = [p for p, c in zip(self._pts, self._cats) if c == 0]
-        if mowed:
-            self.ax.scatter([p.x for p in mowed], [p.y for p in mowed],
+        """Pelouse entière en vert pâle, tonte de la période affichée en vert
+        franc par-dessus, zones interdites en rouge, puis les chemins."""
+        if self._grid is None:
+            # trace trop courte pour un quadrillage : on retombe sur des points
+            self.ax.scatter([p.x for p in self._pts], [p.y for p in self._pts],
                             color=COL_ZONE_PALE if pale else COL_ZONE,
                             s=14, linewidths=0, zorder=2)
-
-        # zones interdites : poches jamais visitées à l'intérieur du terrain
-        if self._forbidden is not None:
-            self.ax.imshow(
-                np.ma.masked_where(~self._forbidden,
-                                   self._forbidden.astype(float)),
-                extent=self._forbidden_extent, origin="lower", aspect="auto",
-                cmap=ListedColormap([COL_FORBIDDEN]),
-                alpha=0.35 if pale else 0.75, interpolation="nearest", zorder=3
-            )
+            return
+        self._fill(self._lawn_mask, COL_LAWN_PALE if pale else COL_LAWN,
+                   1.0, zorder=1)
+        self._fill(self._mowed_mask, COL_ZONE_PALE if pale else COL_ZONE,
+                   1.0, zorder=2)
+        self._fill(self._forbidden, COL_FORBIDDEN, 0.35 if pale else 0.8,
+                   zorder=3)
 
         a = 0.4 if pale else 1.0
         if self._show.get("zone", True):
@@ -300,8 +315,10 @@ class TrackCanvas(FigureCanvas):
 
     def _legend(self, analysis: bool):
         handles = [
-            Line2D([], [], marker="o", linestyle="", color=COL_ZONE,
-                   label="Zone tondue"),
+            Line2D([], [], marker="s", linestyle="", color=COL_ZONE,
+                   label="Tondu sur la période affichée"),
+            Line2D([], [], marker="s", linestyle="", color=COL_LAWN,
+                   label="Pelouse (tout l'historique)"),
         ]
         if self._show.get("station", True) and self._runs(1):
             handles.append(Line2D([], [], color=COL_WAY_STATION,
@@ -341,22 +358,38 @@ class TrackCanvas(FigureCanvas):
     def plot_track(self, points: list[TrackPoint], filter_outliers: bool = True,
                    station_intervals=None, zone_intervals=None,
                    magnetic_intervals=None, station_xy=None,
-                   show_forbidden: bool = True, show=None):
+                   show_forbidden: bool = True, show=None, all_points=None):
+        """`points` : la période affichée (vert franc).
+        `all_points` : tout l'historique, qui définit l'étendue de la pelouse
+        (vert pâle) — c'est ce contraste qui montre ce qui a été tondu."""
         self._reset_axes()
         self._analysis_start = None
         self._show = show or {}
         self._station = station_xy
+
+        base = self._filter_points(all_points if all_points else points,
+                                   filter_outliers)
+        self._grid = build_grid([p.x for p in base], [p.y for p in base])
+        self._lawn_mask = None
+        self._forbidden = None
+        if self._grid is not None:
+            self._lawn_mask = rasterize([p.x for p in base],
+                                        [p.y for p in base], self._grid)
+            if show_forbidden:
+                self._forbidden = forbidden_zones(self._lawn_mask, self._grid)
+
         self._pts = self._filter_points(points, filter_outliers)
         self._ts = [p.ts for p in self._pts]
         self._cats = classify_points(self._pts, station_intervals or [],
                                      zone_intervals or [],
                                      magnetic=magnetic_intervals or [])
-        if show_forbidden and self._pts:
-            self._forbidden, self._forbidden_extent = forbidden_zones(
-                [p.x for p in self._pts], [p.y for p in self._pts]
-            )
-        else:
-            self._forbidden = self._forbidden_extent = None
+        mowed = [p for p, c in zip(self._pts, self._cats) if c == 0]
+        self._mowed_mask = (
+            rasterize([p.x for p in mowed], [p.y for p in mowed], self._grid)
+            if self._grid is not None else None
+        )
+        # la vue doit englober toute la pelouse, pas seulement le jour affiché
+        self._view_pts = base or self._pts
         if not self._pts:
             self.draw()
             return
@@ -373,6 +406,15 @@ class TrackCanvas(FigureCanvas):
         self.reset_view()
         self._update_robot(self._pts[-1])
         self.draw()
+
+    def coverage(self):
+        """(surface tondue sur la période, surface totale) en m², ou None."""
+        if self._grid is None or self._lawn_mask is None \
+                or self._mowed_mask is None:
+            return None
+        area = self._grid.cell * self._grid.cell
+        return float(self._mowed_mask.sum()) * area, \
+            float(self._lawn_mask.sum()) * area
 
     def select_time(self, ts: datetime) -> TrackPoint | None:
         """Anneau rose sur le point le plus proche de `ts` (vue normale)."""
@@ -995,8 +1037,12 @@ class MainWindow(QMainWindow):
         start = self.dt_start.dateTime().toPython()
         end = self.dt_end.dateTime().toPython()
         pts = [p for p in self.session.track if start <= p.ts <= end]
+        # tout l'historique valide : il dessine la pelouse en vert pâle,
+        # sur laquelle se détache la tonte de la période choisie
+        history = [p for p in self.session.track if p.ts.year >= 2020]
         self.canvas.plot_track(
             pts,
+            all_points=history,
             filter_outliers=self.chk_outliers.isChecked(),
             station_intervals=self._station_intervals,
             zone_intervals=self._zone_intervals,
@@ -1009,6 +1055,14 @@ class MainWindow(QMainWindow):
                 "zone": self.chk_way_zone.isChecked(),
             },
         )
+        cov = self.canvas.coverage()
+        if cov:
+            mowed, lawn = cov
+            pct = 100 * mowed / lawn if lawn else 0
+            self.statusBar().showMessage(
+                f"Tonte affichée : {mowed:.0f} m² sur {lawn:.0f} m² de pelouse "
+                f"({pct:.0f} %) — {len(pts)} positions."
+            )
 
     def refresh_log_list(self):
         if not self.session:
