@@ -35,6 +35,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
 from parser import load_session_from_folder, load_session, RobotSession, TrackPoint
+from logbible import analyze_line
 
 
 APP_TITLE = "Robot Log Viewer"
@@ -396,6 +397,31 @@ class MainWindow(QMainWindow):
         form.addRow("Planning :", self.txt_schedule)
         self.tabs.addTab(info_box, "Infos")
 
+        # Onglet diagnostic (Log bible)
+        self.diag_widget = QWidget()
+        diag_layout = QVBoxLayout(self.diag_widget)
+        diag_bar = QHBoxLayout()
+        self.chk_diag_errors = QCheckBox("Erreurs et alertes uniquement")
+        self.chk_diag_errors.setChecked(True)
+        self.chk_diag_errors.stateChanged.connect(self.refresh_diagnostic)
+        diag_bar.addWidget(self.chk_diag_errors)
+        self.lbl_diag = QLabel("")
+        diag_bar.addWidget(self.lbl_diag, stretch=1)
+        diag_layout.addLayout(diag_bar)
+        self.list_diag = QListWidget()
+        self.list_diag.setStyleSheet("font-size: 12px;")
+        self.list_diag.setWordWrap(True)
+        self.list_diag.currentRowChanged.connect(self.on_diag_row_changed)
+        diag_layout.addWidget(self.list_diag, stretch=1)
+        diag_hint = QLabel(
+            "Cliquez sur un événement : il est repéré sur la carte — lancez ensuite "
+            "« Show time path » pour rejouer ce que faisait le robot à ce moment-là."
+        )
+        diag_hint.setWordWrap(True)
+        diag_hint.setStyleSheet("color: #888888; font-size: 10px;")
+        diag_layout.addWidget(diag_hint)
+        self.tabs.addTab(self.diag_widget, "Diagnostic")
+
         # Onglet logs
         self.logs_widget = QWidget()
         logs_layout = QVBoxLayout(self.logs_widget)
@@ -639,6 +665,83 @@ class MainWindow(QMainWindow):
     def refresh_view(self):
         self.refresh_track()
         self.refresh_log_list()
+        self.refresh_diagnostic()
+
+    def refresh_diagnostic(self):
+        """Analyse les logs avec la Log bible et remplit l'onglet Diagnostic."""
+        if not self.session:
+            return
+        start = self.dt_start.dateTime().toPython()
+        end = self.dt_end.dateTime().toPython()
+
+        events = []  # (ts, diag, count)
+        for l in self.session.lines:
+            if l.ts is None or not (start <= l.ts <= end):
+                continue
+            diag = analyze_line(l.raw)
+            if diag is None:
+                continue
+            # regroupe les répétitions immédiates du même événement (ex. chocs en rafale)
+            if events and events[-1][1]["meaning"] == diag["meaning"] \
+                    and (l.ts - events[-1][0]).total_seconds() < 5:
+                events[-1] = (l.ts, diag, events[-1][2] + 1)
+            else:
+                events.append((l.ts, diag, 1))
+
+        n_err = sum(1 for _, d, _ in events if d["severity"] == "error")
+        n_warn = sum(1 for _, d, _ in events if d["severity"] == "warn")
+
+        only_problems = self.chk_diag_errors.isChecked()
+        self.list_diag.blockSignals(True)
+        self.list_diag.clear()
+        shown = 0
+        for ts, d, count in events:
+            if only_problems and d["severity"] == "info":
+                continue
+            text = f"{ts:%d/%m %H:%M:%S}   [{d['category']}]  {d['meaning']}"
+            if count > 1:
+                text += f"  (×{count})"
+            if d["conclusion"]:
+                text += f"\n        → {d['conclusion']}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, ts)
+            if d["severity"] == "error":
+                item.setForeground(QColor("#c62828"))
+            elif d["severity"] == "warn":
+                item.setForeground(QColor("#b36b00"))
+            else:
+                item.setForeground(QColor("#555555"))
+            self.list_diag.addItem(item)
+            shown += 1
+        self.list_diag.blockSignals(False)
+
+        self.lbl_diag.setText(
+            f"{n_err} erreur(s), {n_warn} alerte(s) — {shown} événement(s) affiché(s)"
+        )
+        self.tabs.setTabText(self.tabs.indexOf(self.diag_widget),
+                             f"Diagnostic ({n_err + n_warn})" if (n_err + n_warn) else "Diagnostic")
+
+    def on_diag_row_changed(self, row: int):
+        """Clic sur un événement du diagnostic : repère le moment sur la carte."""
+        if row < 0 or not self.session:
+            return
+        item = self.list_diag.item(row)
+        ts = item.data(Qt.UserRole) if item else None
+        if ts is None:
+            return
+        self.analysis_start = ts
+        if self.btn_timepath.isChecked():
+            self.analysis_time = ts
+            self.canvas.enter_analysis(ts)
+            self.canvas.show_until(ts)
+            self.lbl_time.setText(f"⏱  {ts:%d/%m/%Y %H:%M:%S}")
+        else:
+            self.canvas.select_time(ts)
+        self.sync_logs_to_time(ts)
+        self.statusBar().showMessage(
+            f"Événement du {ts:%d/%m/%Y %H:%M:%S} repéré sur la carte — "
+            "« Show time path » pour rejouer le comportement."
+        )
 
     def refresh_track(self):
         if not self.session:
