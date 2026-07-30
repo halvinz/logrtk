@@ -13,6 +13,7 @@ Gravités : "error" (rouge), "warn" (orange), "info" (gris).
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Optional
 
 
@@ -89,13 +90,101 @@ _RE_BLADE_H = re.compile(r"getBladeHeight\D*(\d+)", re.I)
 _RE_MAGNET_VAL = re.compile(r"magnetic info\D*(-?\d+)", re.I)
 _RE_BUTTON = re.compile(r"button pressed is\W*(\d+)", re.I)
 _RE_RTK_FLAG = re.compile(r"RTK flag\s*(\d)\s*->\s*(\d)", re.I)
+_RE_ESC_MODE = re.compile(r"handle_?mode\s*:\s*(?:ES_HANDLEMODE_)?(\w+)", re.I)
+_RE_ESC_TYPE = re.compile(r"handle_type\s*:\s*(?:ES_TYPE_)?(\w+)", re.I)
+
+# Procédures d'échappement : le robot s'est retrouvé piégé et se dégage.
+# Le mode dit COMMENT il se dégage, le type dit CE QUI l'a piégé.
+ESCAPE_MODES = {
+    "SEARCH_FAIL": ("Blocage / échappement",
+                    "Le robot ne trouve plus de chemin (piégé)", "error"),
+    "SEARCHFAIL": ("Blocage / échappement",
+                   "Le robot ne trouve plus de chemin (piégé)", "error"),
+    "WHEEL_SLIP": ("Patinage", "Patinage des roues", "warn"),
+    "CONTINUOUS_COLLISION": ("Blocage / échappement", "Collisions répétées", "error"),
+    "CONTINOUS_COLLISION": ("Blocage / échappement", "Collisions répétées", "error"),
+    "SERIES_BUMP": ("Blocage / échappement", "Chocs à répétition", "warn"),
+    "DENSE_GRASS": ("Tonte", "Mode herbe dense activé", "info"),
+}
+
+ESCAPE_TYPES = {
+    "SLIP": "patinage",
+    "BORDER": "bloqué en bordure",
+    "BUMP": "choc",
+    "SERIES_BUMP": "chocs répétés",
+    "OBSTACLE": "obstacle",
+    "THREE_OBS": "obstacle rencontré trois fois",
+    "WHEEL_STALL": "roue bloquée",
+    "SERIES_WHEEL_STALL": "roues bloquées à répétition",
+    "MOTOR_OVERHEAT": "surchauffe du moteur",
+    "RAISE": "robot soulevé",
+    "NORMAL": "",
+}
+
+# Causes qui méritent une alerte rouge même si l'échappement réussit
+ESCAPE_SERIOUS = {"MOTOR_OVERHEAT", "RAISE", "SERIES_WHEEL_STALL", "WHEEL_STALL"}
 _RE_SLIP = re.compile(r"slip is\s*([\d.]+)", re.I)
 _RE_ISLAND = re.compile(r"island_vec num\s*=\s*(\d+)", re.I)
 
 
-def _r(category, severity, meaning, conclusion=""):
-    return {"category": category, "severity": severity,
-            "meaning": meaning, "conclusion": conclusion}
+# Mots en français courant rattachés à chaque catégorie : ils rendent la
+# recherche de panne possible alors que les logs, eux, sont en anglais.
+CATEGORY_KEYS = {
+    "État du robot": "etat mode marche arret veille",
+    "Démarrage": "demarrage depart planning app clavier",
+    "Extinction": "extinction arret eteint",
+    "Erreur M3": "erreur alarme m3 defaut panne",
+    "Moteur de roue": "moteur roue avance recule bloque surintensite surchauffe cablage hall",
+    "Hauteur de coupe": "hauteur coupe lame tonte reglage encodeur",
+    "Pare-chocs": "choc bump pare-chocs collision obstacle heurte tape",
+    "Capteur de pluie": "pluie humide rain capteur",
+    "Bande magnétique": "bande magnetique magnetic guidage fil cable",
+    "OAS (ultrasons)": "ultrason oas obstacle detection capteur",
+    "Navigation": "navigation chemin passage etroit coince bloque piege trap echappement collision",
+    "Patinage": "patinage patine glisse derape roues pente humide slip",
+    "Tonte": "tonte tondre bordure herbe dense",
+    "Signal RTK": "rtk gps gnss signal satellite antenne ombre 4g reseau position",
+    "Clavier": "touche bouton clavier appui",
+    "Carte": "carte zone ilot interdit obstacle bordure",
+}
+
+
+def _r(category, severity, meaning, conclusion="", keys=""):
+    """`keys` : mots supplémentaires en français courant pour retrouver la
+    panne dans la recherche (le log, lui, est en anglais)."""
+    all_keys = " ".join(filter(None, (CATEGORY_KEYS.get(category, ""), keys)))
+    return {"category": category, "severity": severity, "meaning": meaning,
+            "conclusion": conclusion, "keys": all_keys}
+
+
+def normalize(s: str) -> str:
+    """Minuscules sans accents, pour une recherche tolérante."""
+    s = unicodedata.normalize("NFD", s.lower())
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+def search_terms(query: str) -> list:
+    """Mots utiles d'une recherche : les articles et petits mots (« un »,
+    « de », « la ») sont écartés, sinon « évite un piège » ne trouverait
+    rien alors que l'utilisateur a écrit une phrase naturelle."""
+    return [w for w in normalize(query).split() if len(w) > 2]
+
+
+# Ce que l'on peut taper dans la recherche de panne (affiché à l'utilisateur)
+SEARCH_CATALOG = [
+    ("Robot coincé", "évite un piège, coincé, bloqué, échappement, trap"),
+    ("Patinage", "patine, glisse, slip, roues qui tournent"),
+    ("Chocs", "choc, bump, pare-chocs, collision, obstacle"),
+    ("Robot soulevé", "soulevé, levage, à l'envers, retourné"),
+    ("Pluie", "pluie, rain, capteur de pluie"),
+    ("Moteur de roue", "moteur, roue, surintensité, surchauffe, câblage, hall"),
+    ("Hauteur de coupe", "hauteur, lame, coupe, encodeur, blade"),
+    ("Signal RTK / GNSS", "rtk, gps, signal, satellite, zone d'ombre"),
+    ("Bande magnétique", "bande, magnétique, magnetic, guidage"),
+    ("Navigation", "chemin introuvable, passage étroit, bordure, navigation"),
+    ("Ultrasons (OAS)", "ultrason, oas, détection obstacle"),
+    ("États et démarrage", "démarrage, extinction, charge, erreur, planning"),
+]
 
 
 # États dans lesquels le robot est à sa base : certaines valeurs y sont
@@ -185,6 +274,13 @@ def analyze_line(raw: str, state: Optional[str] = None) -> Optional[dict]:
         return _r("Bande magnétique", "error",
                   "Erreur de détection de la bande magnétique",
                   "Déclenchement de l'erreur à l'arrivée")
+    if "magneticstart" in low or "startfollowstripe" in low:
+        return _r("Bande magnétique", "info",
+                  "Début du guidage par la bande magnétique")
+    if "magneticstop" in low:
+        return _r("Bande magnétique", "info",
+                  "Fin du guidage par la bande magnétique")
+
     if "magnetic info" in low:
         m = _RE_MAGNET_VAL.search(raw)
         if m and int(m.group(1)) < 1500:
@@ -201,8 +297,29 @@ def analyze_line(raw: str, state: Optional[str] = None) -> Optional[dict]:
         return _r("Navigation", "warn", "Chemin introuvable",
                   "Passage souvent trop étroit à cet endroit")
 
-    if "escaping from trap" in low:
-        return _r("Navigation", "warn", "Procédure d'échappement (robot coincé)")
+    if "escaping from trap" in low or "escape" in low:
+        m_mode = _RE_ESC_MODE.search(raw)
+        m_type = _RE_ESC_TYPE.search(raw)
+        if not m_mode and "escaping from trap" not in low:
+            return None
+        mode = m_mode.group(1).upper() if m_mode else ""
+        cat, meaning, sev = ESCAPE_MODES.get(
+            mode, ("Blocage / échappement", "Procédure d'échappement (robot piégé)", "warn")
+        )
+        cause = ""
+        if m_type:
+            code = m_type.group(1).upper()
+            cause = ESCAPE_TYPES.get(code, code.lower().replace("_", " "))
+            if code in ESCAPE_SERIOUS:
+                sev = "error"
+        # « Patinage des roues — cause : patinage » n'apprend rien : on
+        # n'ajoute la cause que si elle n'est pas déjà dans le libellé.
+        if cause and normalize(cause) not in normalize(meaning):
+            meaning = f"{meaning} — cause : {cause}"
+        return _r(cat, sev, meaning,
+                  "Le robot s'est retrouvé piégé et tente de se dégager — "
+                  "voir l'endroit exact sur la carte",
+                  keys="evite piege trappe sort coince immobilise degage echappement escape")
 
     if "handlemode_dense_grass" in low:
         return _r("Tonte", "info", "Mode herbe dense activé")

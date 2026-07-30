@@ -38,7 +38,7 @@ from matplotlib.lines import Line2D
 from matplotlib.colors import ListedColormap
 
 from parser import load_session_from_folder, load_session, RobotSession, TrackPoint
-from logbible import analyze_line
+from logbible import analyze_line, normalize, search_terms, SEARCH_CATALOG
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position)
 
@@ -564,6 +564,20 @@ class MainWindow(QMainWindow):
         # Onglet diagnostic (Log bible)
         self.diag_widget = QWidget()
         diag_layout = QVBoxLayout(self.diag_widget)
+        search_diag = QHBoxLayout()
+        self.txt_diag_search = QLineEdit()
+        self.txt_diag_search.setPlaceholderText(
+            "Rechercher une panne : évite un piège, patine, choc, pluie, rtk…"
+        )
+        self.txt_diag_search.textChanged.connect(self.refresh_diagnostic)
+        search_diag.addWidget(self.txt_diag_search, stretch=1)
+        btn_help = QPushButton("?")
+        btn_help.setMaximumWidth(30)
+        btn_help.setToolTip("Que peut-on rechercher ?")
+        btn_help.clicked.connect(self.show_search_help)
+        search_diag.addWidget(btn_help)
+        diag_layout.addLayout(search_diag)
+
         diag_bar = QHBoxLayout()
         self.chk_diag_errors = QCheckBox("Erreurs et alertes uniquement")
         self.chk_diag_errors.setChecked(True)
@@ -883,23 +897,34 @@ class MainWindow(QMainWindow):
             diag = analyze_line(l.raw, state)
             if diag is None:
                 continue
-            if events and events[-1][2]["category"] == diag["category"] \
-                    and events[-1][2]["severity"] == diag["severity"] \
+            # On regroupe sur le libellé exact (et non la seule catégorie) :
+            # sinon une cause rare — surchauffe moteur, roue bloquée — serait
+            # avalée par la rafale voisine et deviendrait introuvable.
+            if events and events[-1][2]["meaning"] == diag["meaning"] \
                     and (l.ts - events[-1][1]) <= BURST:
                 events[-1][1] = l.ts
                 events[-1][3] += 1
             else:
-                events.append([l.ts, l.ts, diag, 1])
+                events.append([l.ts, l.ts, diag, 1, l.raw])
 
         n_err = sum(1 for e in events if e[2]["severity"] == "error")
         n_warn = sum(1 for e in events if e[2]["severity"] == "warn")
+
+        # Recherche de panne : tous les mots tapés doivent se retrouver dans la
+        # description, la solution, les synonymes français ou la ligne de log.
+        words = search_terms(self.txt_diag_search.text())
 
         only_problems = self.chk_diag_errors.isChecked()
         self.list_diag.blockSignals(True)
         self.list_diag.clear()
         shown = 0
-        for ts, ts_end, d, count in events:
-            if only_problems and d["severity"] == "info":
+        for ts, ts_end, d, count, raw in events:
+            if words:
+                hay = normalize(" ".join((d["category"], d["meaning"],
+                                          d["conclusion"], d["keys"], raw)))
+                if not all(w in hay for w in words):
+                    continue
+            elif only_problems and d["severity"] == "info":
                 continue
             text = f"{ts:%d/%m %H:%M:%S}   [{d['category']}]  {d['meaning']}"
             if count > 1:
@@ -918,11 +943,29 @@ class MainWindow(QMainWindow):
             shown += 1
         self.list_diag.blockSignals(False)
 
-        self.lbl_diag.setText(
-            f"{n_err} erreur(s), {n_warn} alerte(s) — {shown} événement(s) affiché(s)"
-        )
+        if words:
+            if shown:
+                self.lbl_diag.setText(f"{shown} événement(s) trouvé(s) pour cette recherche")
+            else:
+                self.lbl_diag.setText(
+                    "Aucun événement de ce type dans ces logs (période affichée)"
+                )
+        else:
+            self.lbl_diag.setText(
+                f"{n_err} erreur(s), {n_warn} alerte(s) — {shown} événement(s) affiché(s)"
+            )
         self.tabs.setTabText(self.tabs.indexOf(self.diag_widget),
                              f"Diagnostic ({n_err + n_warn})" if (n_err + n_warn) else "Diagnostic")
+
+    def show_search_help(self):
+        lines = ["Tapez ce que vous cherchez en français, le logiciel fait le lien",
+                 "avec les messages anglais des logs.", ""]
+        for titre, mots in SEARCH_CATALOG:
+            lines.append(f"• {titre} : {mots}")
+        lines += ["", "Vous pouvez aussi taper le texte anglais du log "
+                      "(ex. « Escaping from trap »),",
+                  "ou plusieurs mots à la fois (ex. « moteur surchauffe »)."]
+        QMessageBox.information(self, "Que peut-on rechercher ?", "\n".join(lines))
 
     def on_diag_row_changed(self, row: int):
         """Clic sur un événement du diagnostic : repère le moment sur la carte."""
