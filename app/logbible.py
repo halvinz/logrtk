@@ -78,14 +78,19 @@ BUTTONS = {
     6: "C", 7: "B", 8: "D", 14: "STOP",
 }
 
-_RE_WORKMODE = re.compile(r"Ui_inter_WorkMode_?\s*(\w+)", re.I)
+# Les changements d'état réels ressemblent à :
+#   [--UI--]Action_Ui_Inter_WorkMode_Change:  *Ui_Inter_WorkMode_Error# --> *Ui_Inter_WorkMode_PrePowerOff#
+# On garde donc la DERNIÈRE occurrence (l'état d'arrivée) et on ignore le mot "Change".
+_RE_WORKMODE = re.compile(r"Ui_Inter_(?:Sub_)?WorkMode_(\w+)", re.I)
 _RE_START_TYPE = re.compile(r"start type is\s*[:\s]*([\w+]+)", re.I)
 _RE_M3_ERROR = re.compile(r"m3 error\s*=\s*(\d+)", re.I)
 _RE_WHEEL = re.compile(r"wheel motor fault\D*(\d+)", re.I)
 _RE_BLADE_H = re.compile(r"getBladeHeight\D*(\d+)", re.I)
 _RE_MAGNET_VAL = re.compile(r"magnetic info\D*(-?\d+)", re.I)
 _RE_BUTTON = re.compile(r"button pressed is\W*(\d+)", re.I)
-_RE_LEVEL = re.compile(r"level\D*(-?\d+)", re.I)
+_RE_RTK_FLAG = re.compile(r"RTK flag\s*(\d)\s*->\s*(\d)", re.I)
+_RE_SLIP = re.compile(r"slip is\s*([\d.]+)", re.I)
+_RE_ISLAND = re.compile(r"island_vec num\s*=\s*(\d+)", re.I)
 
 
 def _r(category, severity, meaning, conclusion=""):
@@ -93,27 +98,38 @@ def _r(category, severity, meaning, conclusion=""):
             "meaning": meaning, "conclusion": conclusion}
 
 
-def analyze_line(raw: str) -> Optional[dict]:
-    """Analyse une ligne de log brute, renvoie un diagnostic ou None."""
+# États dans lesquels le robot est à sa base : certaines valeurs y sont
+# normalement basses et ne doivent pas déclencher d'alerte.
+AT_STATION = ("charge", "checkcharge", "precheckinstation", "docking",
+              "idle", "ready", "none", "prepoweroff")
+
+
+def analyze_line(raw: str, state: Optional[str] = None) -> Optional[dict]:
+    """Analyse une ligne de log brute, renvoie un diagnostic ou None.
+
+    `state` est l'état du robot au moment de cette ligne (workmode courant) :
+    il sert aux règles qui ne valent qu'en dehors de la station de charge.
+    """
     low = raw.lower()
 
-    if "ui_inter_workmode" in low:
-        m = _RE_WORKMODE.search(raw)
-        if m:
-            mode = m.group(1)
-            for name, (meaning, sev) in WORKMODES.items():
-                if mode.lower().startswith(name.lower()) and name != "None":
-                    return _r("État du robot", sev, meaning)
-            if mode.lower().startswith("none"):
-                return _r("État du robot", "info", WORKMODES["None"][0])
+    if "workmode" in low:
+        found = [m for m in _RE_WORKMODE.findall(raw) if m.lower() != "change"]
+        if not found:
+            return None
+        mode = found[-1].lower()          # état d'arrivée
+        sub = "sub_workmode" in low
+        for name, (meaning, sev) in WORKMODES.items():
+            if mode.startswith(name.lower()):
+                label = f"{meaning} (sous-état)" if sub else meaning
+                return _r("État du robot", "info" if sub else sev, label)
         return None
 
     if "start type is" in low:
         m = _RE_START_TYPE.search(raw)
-        if m:
-            label = START_TYPES.get(m.group(1), f"Type de démarrage : {m.group(1)}")
-            return _r("Démarrage", "info", label)
-        return _r("Démarrage", "info", "Démarrage")
+        if not m or m.group(1).upper().startswith("NO_START"):
+            return None
+        return _r("Démarrage", "info",
+                  START_TYPES.get(m.group(1), f"Type de démarrage : {m.group(1)}"))
 
     if "power off" in low or "shut down" in low:
         for needle, label in POWEROFF:
@@ -124,6 +140,8 @@ def analyze_line(raw: str) -> Optional[dict]:
         m = _RE_M3_ERROR.search(raw)
         if m:
             code = int(m.group(1))
+            if code == 0:
+                return None  # retour à la normale
             if code in M3_ERRORS:
                 meaning, sev, concl = M3_ERRORS[code]
                 return _r("Erreur M3", sev, meaning, concl)
@@ -200,17 +218,40 @@ def analyze_line(raw: str) -> Optional[dict]:
         return _r("Signal RTK", "error", "Perte de signal RTK",
                   "Vérifier antenne/ciel dégagé ; possible coupure 4G (Level < 15000 hors station)")
 
-    if "task monitor" in low:
-        m = _RE_LEVEL.search(low)
-        if m and int(m.group(1)) < 15000:
-            return _r("Signal 4G", "warn",
-                      f"Signal 4G faible (Level {m.group(1)} < 15000)",
-                      "Hors station de charge : risque de coupure RTK suite à la perte 4G")
-        return None  # niveau correct : rien à signaler
+    # Perte / retour du signal RTK : information fiable et sans ambiguïté.
+    m = _RE_RTK_FLAG.search(raw)
+    if m:
+        before, after = m.group(1), m.group(2)
+        if before == "1" and after == "0":
+            return _r("Signal RTK", "error", "Perte du signal RTK",
+                      "Zone d'ombre, antenne masquée ou coupure 4G — voir l'endroit sur la carte")
+        if before == "0" and after == "1":
+            return _r("Signal RTK", "info", "Signal RTK retrouvé")
+        return None
 
-    if "slip" in low:
-        return _r("Odomètre", "warn", "Patinage détecté (roues qui glissent)",
-                  "Sol glissant, pente ou herbe humide — vérifier l'endroit sur la carte")
+    if "shadow" in low and "gnss" in low:
+        return _r("Signal RTK", "warn", "Zone d'ombre GNSS détectée",
+                  "Réception satellite dégradée à cet endroit")
+
+    if "slip is" in low:
+        m = _RE_SLIP.search(raw)
+        # l'erreur de fusion est loguée en continu : on n'alerte qu'au-delà du seuil
+        if m and float(m.group(1)) >= 0.5:
+            return _r("Patinage", "warn",
+                      f"Patinage important (erreur de fusion {m.group(1)})",
+                      "Roues qui glissent : sol humide, pente ou herbe haute")
+        return None
+    if "wheel_slip" in low or "es_type_slip" in low:
+        return _r("Patinage", "error", "Patinage : procédure d'échappement déclenchée",
+                  "Le robot patine et tente de se dégager — voir l'endroit sur la carte")
+
+    if "island_vec num" in low:
+        m = _RE_ISLAND.search(raw)
+        if m:
+            return _r("Carte", "info",
+                      f"{m.group(1)} îlot(s) / zone(s) interdite(s) dans la carte")
+    if "inner border size" in low:
+        return _r("Carte", "info", raw.split("]")[-1].strip())
 
     if "button pressed is" in low:
         m = _RE_BUTTON.search(raw)

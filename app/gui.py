@@ -5,8 +5,10 @@ gui.py — Interface principale : Robot Log Viewer
   ..._MODEL.log / ..._pos.log / ..._boot.log / dmesg.txt dans le dossier
   choisi (comme dans l'archive .tar exportée par le robot).
 - Carte façon appli officielle : zone tondue en vert plein sur fond clair,
-  station de charge, position du robot. Molette = zoom, glisser = déplacer,
-  double-clic = vue entière, clic = choisir un moment.
+  station de charge en jaune, zones interdites en rouge, chemins vers la
+  station en traits noirs et vers une autre zone en vert clair, robot avec
+  sa flèche de cap. Molette = zoom, glisser = déplacer, double-clic = vue
+  entière, clic = choisir un moment.
 - Mode "Show time path" : à partir du moment choisi, Espace fait avancer
   le robot seconde par seconde sur la carte (Maj+Espace pour reculer),
   le chemin parcouru se dessine en bleu et les logs suivent.
@@ -15,11 +17,8 @@ gui.py — Interface principale : Robot Log Viewer
 from __future__ import annotations
 
 import os
-import re
 import sys
-import math
 import bisect
-import statistics
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import Qt, QEvent
@@ -32,12 +31,19 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QColor
 
+import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.colors import ListedColormap
 
 from parser import load_session_from_folder, load_session, RobotSession, TrackPoint
 from logbible import analyze_line
+from mapmodel import (path_intervals, classify_points, forbidden_zones,
+                      extract_state)
+
+# Fenêtre de regroupement des événements identiques dans l'onglet Diagnostic
+GROUP_SECONDS = 120
 
 
 APP_TITLE = "Robot Log Viewer"
@@ -48,10 +54,12 @@ COL_ZONE = "#28a95c"       # vert plein de la zone tondue
 COL_ZONE_PALE = "#c4e9d2"  # même zone, estompée (mode analyse)
 COL_PATH = "#1565c0"       # chemin parcouru en mode analyse
 COL_ROBOT = "#111111"      # position du robot
+COL_STATION = "#ffd400"    # station de charge (jaune)
 COL_STATION_EDGE = "#111111"
 COL_SELECT = "#d81b60"     # anneau de sélection
-COL_WAY = "#8d8d8d"        # chemins (trajets station <-> zones)
-COL_WAY_PALE = "#d8d8d8"
+COL_WAY_STATION = "#111111"  # chemin vers la station : traits noirs
+COL_WAY_ZONE = "#7fdc9c"     # chemin vers une autre zone : vert clair
+COL_FORBIDDEN = "#e53935"    # zones interdites (îlots)
 
 
 class TrackCanvas(FigureCanvas):
@@ -71,11 +79,13 @@ class TrackCanvas(FigureCanvas):
 
         self._pts: list[TrackPoint] = []
         self._ts: list[datetime] = []
-        self._transit: list[bool] = []
+        self._cats: list[int] = []   # 0 tonte, 1 chemin station, 2 chemin zone
         self._sel_marker = None
         self._trail = None
         self._robot_marker = None
         self._robot_arrow = None
+        self._forbidden = None
+        self._forbidden_extent = None
         self._analysis_start: datetime | None = None
         self.on_point_clicked = None  # callback(TrackPoint), posé par MainWindow
 
@@ -97,7 +107,9 @@ class TrackCanvas(FigureCanvas):
         self.ax.set_yticks([])
         for spine in self.ax.spines.values():
             spine.set_color("#dddddd")
-        self.ax.set_aspect("equal", adjustable="datalim")
+        # "box" (et non "datalim") : matplotlib ajuste le cadre du graphique,
+        # jamais les limites — toute la carte reste donc visible.
+        self.ax.set_aspect("equal", adjustable="box")
         self._sel_marker = None
         self._trail = None
         self._robot_marker = None
@@ -160,80 +172,130 @@ class TrackCanvas(FigureCanvas):
             return
         xs = [p.x for p in self._pts] + [0.0]
         ys = [p.y for p in self._pts] + [0.0]
-        margin_x = max((max(xs) - min(xs)) * 0.05, 1.0)
-        margin_y = max((max(ys) - min(ys)) * 0.05, 1.0)
+        margin_x = max((max(xs) - min(xs)) * 0.08, 1.0)
+        margin_y = max((max(ys) - min(ys)) * 0.08, 1.0)
         self.ax.set_xlim(min(xs) - margin_x, max(xs) + margin_x)
         self.ax.set_ylim(min(ys) - margin_y, max(ys) + margin_y)
+        # imshow (zones interdites) peut avoir modifié l'aspect : on le réimpose
+        self.ax.set_aspect("equal", adjustable="box")
         self.draw_idle()
 
     # ------------------------------------------------------------------
     # Aides de tracé
     # ------------------------------------------------------------------
     def _filter_points(self, points, filter_outliers):
+        """Écarte les positions aberrantes (sauts SLAM à plusieurs centaines de
+        mètres). Le filtre est relatif à l'étendue réelle du terrain : quelques
+        points fous suffisaient sinon à réduire tout le jardin à un timbre-poste.
+        """
         pts = points
-        if filter_outliers and len(pts) > 10:
-            mx = statistics.median(p.x for p in pts)
-            my = statistics.median(p.y for p in pts)
-            pts = [p for p in pts if abs(p.x - mx) < 300 and abs(p.y - my) < 300]
-        return pts
+        if not filter_outliers or len(pts) < 50:
+            return pts
+
+        xs = sorted(p.x for p in pts)
+        ys = sorted(p.y for p in pts)
+
+        def bounds(vals):
+            lo = vals[int(len(vals) * 0.01)]
+            hi = vals[min(int(len(vals) * 0.99), len(vals) - 1)]
+            pad = max((hi - lo) * 0.5, 2.0)   # large marge : on ne coupe pas une zone éloignée
+            return lo - pad, hi + pad
+
+        x_lo, x_hi = bounds(xs)
+        y_lo, y_hi = bounds(ys)
+        kept = [p for p in pts
+                if x_lo <= p.x <= x_hi and y_lo <= p.y <= y_hi]
+        return kept if kept else pts
+
+    def _runs(self, cat: int):
+        """Suites de points consécutifs d'une même catégorie, pour tracer des
+        traits continus plutôt qu'un nuage de points."""
+        runs, cur = [], []
+        for p, c in zip(self._pts, self._cats):
+            if c == cat:
+                cur.append(p)
+            elif cur:
+                runs.append(cur)
+                cur = []
+        if cur:
+            runs.append(cur)
+        return [r for r in runs if len(r) >= 2]
 
     def _draw_zone(self, pale: bool):
-        """Zone tondue en vert + chemins (trajets station <-> zones) en gris."""
-        zone = [p for p, t in zip(self._pts, self._transit) if not t]
-        ways = [p for p, t in zip(self._pts, self._transit) if t]
-        if zone:
-            self.ax.scatter([p.x for p in zone], [p.y for p in zone],
+        """Zone tondue (vert), chemins station (traits noirs), chemins vers une
+        autre zone (vert clair), zones interdites (rouge)."""
+        mowed = [p for p, c in zip(self._pts, self._cats) if c == 0]
+        if mowed:
+            self.ax.scatter([p.x for p in mowed], [p.y for p in mowed],
                             color=COL_ZONE_PALE if pale else COL_ZONE,
-                            s=14, linewidths=0, zorder=1)
-        if ways:
-            self.ax.scatter([p.x for p in ways], [p.y for p in ways],
-                            color=COL_WAY_PALE if pale else COL_WAY,
-                            s=7, linewidths=0, zorder=2)
+                            s=14, linewidths=0, zorder=2)
+
+        # zones interdites : poches jamais visitées à l'intérieur du terrain
+        if self._forbidden is not None:
+            self.ax.imshow(
+                np.ma.masked_where(~self._forbidden,
+                                   self._forbidden.astype(float)),
+                extent=self._forbidden_extent, origin="lower", aspect="auto",
+                cmap=ListedColormap([COL_FORBIDDEN]),
+                alpha=0.35 if pale else 0.75, interpolation="nearest", zorder=3
+            )
+
+        for run in self._runs(2):
+            self.ax.plot([p.x for p in run], [p.y for p in run],
+                         color=COL_WAY_ZONE, linewidth=2.6,
+                         alpha=0.4 if pale else 1.0,
+                         solid_capstyle="round", zorder=4)
+        for run in self._runs(1):
+            self.ax.plot([p.x for p in run], [p.y for p in run],
+                         color=COL_WAY_STATION, linewidth=1.8,
+                         linestyle=(0, (5, 3)), alpha=0.4 if pale else 1.0,
+                         zorder=4)
 
     def _make_robot_artists(self):
-        """Crée le rond du robot + sa flèche de sens d'avancement (odomètre)."""
+        """Rond du robot + petit triangle de cap posé dessus (odomètre).
+        Les deux sont dimensionnés en points écran : la flèche garde la même
+        taille quel que soit le zoom."""
         (self._robot_marker,) = self.ax.plot(
-            [], [], marker="o", markersize=11, markerfacecolor=COL_ROBOT,
-            markeredgecolor="white", markeredgewidth=1.5, linestyle="", zorder=6
+            [], [], marker="o", markersize=14, markerfacecolor=COL_ROBOT,
+            markeredgecolor="white", markeredgewidth=1.5, linestyle="", zorder=7
         )
-        self._robot_arrow = self.ax.quiver(
-            [0.0], [0.0], [0.0], [0.0], angles="xy", scale_units="xy", scale=1,
-            color=COL_ROBOT, width=0.006, zorder=8
+        (self._robot_arrow,) = self.ax.plot(
+            [], [], marker=(3, 0, 0), markersize=7, markerfacecolor="white",
+            markeredgecolor="white", linestyle="", zorder=8
         )
 
     def _update_robot(self, p: TrackPoint):
-        """Place le robot en `p` avec la flèche orientée selon son cap."""
+        """Place le robot en `p`, triangle orienté selon son cap."""
         if self._robot_marker is None:
             return
         self._robot_marker.set_data([p.x], [p.y])
         if self._robot_arrow is not None:
-            xlim = self.ax.get_xlim()
-            length = (xlim[1] - xlim[0]) * 0.05
-            rad = math.radians(p.heading)
-            self._robot_arrow.set_offsets([[p.x, p.y]])
-            self._robot_arrow.set_UVC([length * math.cos(rad)],
-                                      [length * math.sin(rad)])
+            # marker=(3, 0, angle) : triangle pointant vers le haut à 0°,
+            # tourné dans le sens trigonométrique. Le cap des logs est mesuré
+            # depuis l'axe X, d'où le -90°.
+            self._robot_arrow.set_marker((3, 0, p.heading - 90))
+            self._robot_arrow.set_data([p.x], [p.y])
 
     def _draw_station(self):
-        self.ax.plot(0, 0, marker="o", markersize=13, markerfacecolor="white",
+        self.ax.plot(0, 0, marker="o", markersize=16, markerfacecolor=COL_STATION,
                      markeredgecolor=COL_STATION_EDGE, markeredgewidth=2,
-                     linestyle="", zorder=5)
-        self.ax.annotate("⚡", (0, 0), ha="center", va="center",
-                         fontsize=8, zorder=6)
+                     linestyle="", zorder=6)
 
     def _legend(self, analysis: bool):
         handles = [
             Line2D([], [], marker="o", linestyle="", color=COL_ZONE,
                    label="Zone tondue"),
-            Line2D([], [], marker="o", linestyle="", color=COL_WAY,
-                   label="Chemins (station ↔ zones)"),
-            Line2D([], [], marker="o", linestyle="", markerfacecolor="white",
-                   markeredgecolor=COL_STATION_EDGE, color="white",
+            Line2D([], [], color=COL_WAY_STATION, linestyle=(0, (5, 3)),
+                   linewidth=1.8, label="Chemin vers la station"),
+            Line2D([], [], color=COL_WAY_ZONE, linewidth=2.6,
+                   label="Chemin vers une autre zone"),
+            Line2D([], [], marker="s", linestyle="", color=COL_FORBIDDEN,
+                   alpha=0.75, label="Zone interdite / obstacle"),
+            Line2D([], [], marker="o", linestyle="", markerfacecolor=COL_STATION,
+                   markeredgecolor=COL_STATION_EDGE, color=COL_STATION,
                    label="Station de charge"),
             Line2D([], [], marker="o", linestyle="", color=COL_ROBOT,
-                   label="Robot"),
-            Line2D([], [], marker=">", linestyle="", color=COL_ROBOT,
-                   label="Flèche = sens d'avancement"),
+                   label="Robot (flèche = sens d'avancement)"),
         ]
         if analysis:
             handles.append(Line2D([], [], color=COL_PATH, linewidth=2,
@@ -250,15 +312,20 @@ class TrackCanvas(FigureCanvas):
     # Vue normale : zone tondue + station + dernière position du robot
     # ------------------------------------------------------------------
     def plot_track(self, points: list[TrackPoint], filter_outliers: bool = True,
-                   transit_intervals: list | None = None):
+                   station_intervals=None, zone_intervals=None,
+                   show_forbidden: bool = True):
         self._reset_axes()
         self._analysis_start = None
         self._pts = self._filter_points(points, filter_outliers)
         self._ts = [p.ts for p in self._pts]
-        intervals = transit_intervals or []
-        self._transit = [
-            any(a <= p.ts < b for a, b in intervals) for p in self._pts
-        ]
+        self._cats = classify_points(self._pts, station_intervals or [],
+                                     zone_intervals or [])
+        if show_forbidden and self._pts:
+            self._forbidden, self._forbidden_extent = forbidden_zones(
+                [p.x for p in self._pts], [p.y for p in self._pts]
+            )
+        else:
+            self._forbidden = self._forbidden_extent = None
         if not self._pts:
             self.draw()
             return
@@ -335,7 +402,8 @@ class MainWindow(QMainWindow):
         self.session: RobotSession | None = None
         self.analysis_start: datetime | None = None  # moment choisi (clic carte / log)
         self.analysis_time: datetime | None = None   # curseur du mode Show time path
-        self._transit_intervals: list = []           # périodes LeaveBase/Return (chemins)
+        self._station_intervals: list = []            # trajets vers/depuis la station
+        self._zone_intervals: list = []               # transferts vers une autre zone
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -366,6 +434,10 @@ class MainWindow(QMainWindow):
         self.chk_outliers = QCheckBox("Filtrer les points aberrants")
         self.chk_outliers.setChecked(True)
         filter_bar.addWidget(self.chk_outliers)
+        self.chk_forbidden = QCheckBox("Zones interdites")
+        self.chk_forbidden.setChecked(True)
+        self.chk_forbidden.stateChanged.connect(self.refresh_track)
+        filter_bar.addWidget(self.chk_forbidden)
         self.btn_apply = QPushButton("Appliquer le filtre")
         self.btn_apply.clicked.connect(self.refresh_view)
         filter_bar.addWidget(self.btn_apply)
@@ -696,7 +768,7 @@ class MainWindow(QMainWindow):
         if self.btn_timepath.isChecked():
             self.btn_timepath.setChecked(False)
 
-        self._transit_intervals = self._compute_transit_intervals()
+        self._station_intervals, self._zone_intervals = path_intervals(s.lines)
 
         self.statusBar().showMessage(
             f"{len(s.track)} points de position — {len(s.lines)} lignes de log."
@@ -719,33 +791,43 @@ class MainWindow(QMainWindow):
         start = self.dt_start.dateTime().toPython()
         end = self.dt_end.dateTime().toPython()
 
-        events = []  # (ts, diag, count)
+        # Une rafale du même problème (chocs, patinage, 4G…) devient une seule
+        # ligne « ×N, de hh:mm:ss à hh:mm:ss » : sinon l'onglet est illisible.
+        BURST = timedelta(seconds=GROUP_SECONDS)
+        events = []  # [ts_debut, ts_fin, diag, count]
+        state = None
         for l in self.session.lines:
-            if l.ts is None or not (start <= l.ts <= end):
+            if l.ts is None:
                 continue
-            diag = analyze_line(l.raw)
+            found = extract_state(l.raw)
+            if found:
+                state = found
+            if not (start <= l.ts <= end):
+                continue
+            diag = analyze_line(l.raw, state)
             if diag is None:
                 continue
-            # regroupe les répétitions immédiates du même événement (ex. chocs en rafale)
-            if events and events[-1][1]["meaning"] == diag["meaning"] \
-                    and (l.ts - events[-1][0]).total_seconds() < 5:
-                events[-1] = (l.ts, diag, events[-1][2] + 1)
+            if events and events[-1][2]["category"] == diag["category"] \
+                    and events[-1][2]["severity"] == diag["severity"] \
+                    and (l.ts - events[-1][1]) <= BURST:
+                events[-1][1] = l.ts
+                events[-1][3] += 1
             else:
-                events.append((l.ts, diag, 1))
+                events.append([l.ts, l.ts, diag, 1])
 
-        n_err = sum(1 for _, d, _ in events if d["severity"] == "error")
-        n_warn = sum(1 for _, d, _ in events if d["severity"] == "warn")
+        n_err = sum(1 for e in events if e[2]["severity"] == "error")
+        n_warn = sum(1 for e in events if e[2]["severity"] == "warn")
 
         only_problems = self.chk_diag_errors.isChecked()
         self.list_diag.blockSignals(True)
         self.list_diag.clear()
         shown = 0
-        for ts, d, count in events:
+        for ts, ts_end, d, count in events:
             if only_problems and d["severity"] == "info":
                 continue
             text = f"{ts:%d/%m %H:%M:%S}   [{d['category']}]  {d['meaning']}"
             if count > 1:
-                text += f"  (×{count})"
+                text += f"  (×{count} jusqu'à {ts_end:%H:%M:%S})"
             if d["conclusion"]:
                 text += f"\n        → {d['conclusion']}"
             item = QListWidgetItem(text)
@@ -788,43 +870,19 @@ class MainWindow(QMainWindow):
             "« Show time path » pour rejouer le comportement."
         )
 
-    def _compute_transit_intervals(self) -> list:
-        """Périodes où le robot est en déplacement station <-> zones,
-        déduites des états LeaveBase / Return des logs : ces portions de
-        trace sont dessinées en gris (chemins) au lieu du vert (tonte)."""
-        if not self.session:
-            return []
-        state_re = re.compile(r"Ui_inter_WorkMode_?\s*(\w+)", re.I)
-        changes = []
-        for l in self.session.lines:
-            if l.ts is None or "ui_inter_workmode" not in l.raw.lower():
-                continue
-            m = state_re.search(l.raw)
-            if m:
-                changes.append((l.ts, m.group(1).lower()))
-        changes.sort(key=lambda c: c[0])
-
-        intervals = []
-        current_start = None
-        for ts, state in changes:
-            in_transit = state.startswith("leavebase") or state.startswith("return")
-            if in_transit and current_start is None:
-                current_start = ts
-            elif not in_transit and current_start is not None:
-                intervals.append((current_start, ts))
-                current_start = None
-        if current_start is not None:
-            intervals.append((current_start, datetime.max))
-        return intervals
-
     def refresh_track(self):
         if not self.session:
             return
         start = self.dt_start.dateTime().toPython()
         end = self.dt_end.dateTime().toPython()
         pts = [p for p in self.session.track if start <= p.ts <= end]
-        self.canvas.plot_track(pts, filter_outliers=self.chk_outliers.isChecked(),
-                               transit_intervals=self._transit_intervals)
+        self.canvas.plot_track(
+            pts,
+            filter_outliers=self.chk_outliers.isChecked(),
+            station_intervals=self._station_intervals,
+            zone_intervals=self._zone_intervals,
+            show_forbidden=self.chk_forbidden.isChecked(),
+        )
 
     def refresh_log_list(self):
         if not self.session:
