@@ -9,7 +9,10 @@ le plus fréquent vers sa cause probable.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
+
+from logbible import FREQUENCES
 
 
 def _plural(n, singulier, pluriel=None):
@@ -54,6 +57,26 @@ def behaviour(states) -> dict:
             elif state.startswith(("prestart", "leavebase")):
                 out["sorties"] += 1
     return out
+
+
+_RE_FREQ = re.compile(r"freq:\[(\d+)\]")
+
+
+def _frequence(session) -> str:
+    """Fréquence de tonte réglée dans les préréglages, en clair."""
+    if not session:
+        return ""
+    vues = []
+    for l in reversed(session.lines):
+        m = _RE_FREQ.search(l.raw)
+        if m:
+            vues.append(int(m.group(1)))
+            if len(vues) >= 3:
+                break
+    if not vues:
+        return ""
+    minutes = vues[0]
+    return FREQUENCES.get(minutes, f"toutes les {minutes} minutes")
 
 
 def _compte(events, categorie=None, gravite=None, episodes=False) -> int:
@@ -112,6 +135,9 @@ def describe(session, events, states, coverage=None, periode=None) -> tuple:
     if b["charges"]:
         lignes.append(f"Station : {_plural(b['charges'], 'mise')} en charge, "
                       f"{_plural(b['sorties'], 'sortie')} de base")
+    planning = _frequence(session)
+    if planning:
+        lignes.append(f"Planning : {planning}")
     if b["extinctions"]:
         lignes.append(f"Extinctions : {b['extinctions']}")
     if b["erreurs"]:
@@ -166,6 +192,21 @@ def _conclure(session, events, b, n_rtk, n_patine, n_choc, n_blocage):
                     "sur cette période : vérifier le planning et les "
                     "conditions de démarrage."), "error"
         return ("Aucune tonte sur cette période."), "warn"
+
+    n_station = _compte(events, "Station de charge", episodes=True)
+    n_bande = _compte(events, "Bande magnétique", episodes=True)
+    faible = (" Le signal de la bande magnétique est faible : bande trop "
+              "enfouie, posée à l'envers, ou bande de zone interdite utilisée "
+              "par erreur." if n_bande else
+              " Vérifier le niveau de la station et son installation.")
+    if n_station >= 3:
+        return (f"Le robot n'arrive pas à rentrer à sa station "
+                f"({n_station} échecs de retour).{faible}"), "error"
+    if n_bande >= 3:
+        return (f"Signal de bande magnétique insuffisant "
+                f"({n_bande} relevés sous le seuil de 1000) : le robot "
+                "risque de ne plus retrouver sa station. Bande trop enfouie, "
+                "posée à l'envers, ou bande de zone interdite."), "warn"
 
     if n_rtk and n_rtk >= max(10, n_patine, n_choc):
         return (f"Problème de localisation dominant ({n_rtk} pertes de "

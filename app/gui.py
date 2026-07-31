@@ -1343,12 +1343,15 @@ class MainWindow(QMainWindow):
         for l in self.session.lines:
             if l.ts is None:
                 continue
+            # On passe l'état PRÉCÉDENT : sur une ligne de changement d'état,
+            # c'est lui qui dit d'où vient le robot (Retour → Erreur).
             found = extract_state(l.raw)
+            precedent = state
             if found:
                 state = found
             if not (start <= l.ts <= end):
                 continue
-            diag = analyze_line(l.raw, state)
+            diag = analyze_line(l.raw, precedent)
             if diag is None and self.session.fmt == "rtk2":
                 # pas de bible pour ce modèle : on se fie à la gravité que
                 # le robot inscrit lui-même dans ses journaux

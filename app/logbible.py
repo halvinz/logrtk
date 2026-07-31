@@ -87,7 +87,13 @@ _RE_START_TYPE = re.compile(r"start type is\s*[:\s]*([\w+]+)", re.I)
 _RE_M3_ERROR = re.compile(r"m3 error\s*=\s*(\d+)", re.I)
 _RE_WHEEL = re.compile(r"wheel motor fault\D*(\d+)", re.I)
 _RE_BLADE_H = re.compile(r"getBladeHeight\D*(\d+)", re.I)
-_RE_MAGNET_VAL = re.compile(r"magnetic info\D*(-?\d+)", re.I)
+_RE_MAGNET_PAIR = re.compile(r"Mag Left:\[(-?\d+)\],?\s*Right:\[(-?\d+)\]", re.I)
+_RE_BLADE_SPEED = re.compile(
+    r"blade setSpeed\((-?\d+),\s*(-?\d+)\),\s*realSpeed\((-?\d+)\s+(-?\d+)\)", re.I)
+
+# Seuils repris du guide de dépannage RTK1
+MAGNET_MIN = 1000          # valeur de bande magnétique acceptable
+BLADE_MIN_RATIO = 0.6      # vitesse réelle minimale, en part de la consigne
 _RE_BUTTON = re.compile(r"button pressed is\W*(\d+)", re.I)
 _RE_RTK_FLAG = re.compile(r"RTK flag\s*(\d)\s*->\s*(\d)", re.I)
 _RE_ESC_MODE = re.compile(r"handle_?mode\s*:\s*(?:ES_HANDLEMODE_)?(\w+)", re.I)
@@ -146,6 +152,16 @@ CATEGORY_KEYS = {
     "Signal RTK": "rtk gps gnss signal satellite antenne ombre 4g reseau position",
     "Clavier": "touche bouton clavier appui",
     "Carte": "carte zone ilot interdit obstacle bordure",
+    "Station de charge": "station base charge accostage docking retour",
+    "Moteur de coupe": "lame coupe moteur disque herbe",
+    "Système": "systeme disque memoire logiciel",
+}
+
+# Fréquences de tonte des préréglages, en minutes (guide de dépannage RTK1)
+FREQUENCES = {
+    480: "trois fois par jour", 720: "deux fois par jour",
+    1440: "une fois par jour", 2880: "tous les deux jours",
+    4320: "tous les trois jours", 10000: "une fois par semaine",
 }
 
 
@@ -310,6 +326,15 @@ def analyze_line(raw: str, state: Optional[str] = None) -> Optional[dict]:
             return None
         mode = found[-1].lower()          # état d'arrivée
         sub = "sub_workmode" in low
+        # Signature documentée : le robot rentrait à la base et bascule en
+        # erreur. Le guide de dépannage y voit un défaut d'accostage.
+        if mode.startswith("error") and state and state.startswith("return") \
+                and not sub:
+            return _r("Station de charge", "error",
+                      "Échec du retour à la station (Retour → Erreur)",
+                      "Vérifier le niveau et le fonctionnement de la station, "
+                      "et la valeur de la bande magnétique juste avant l'erreur",
+                      keys="station accostage retour docking base erreur rentrer")
         for name, (meaning, sev) in WORKMODES.items():
             if mode.startswith(name.lower()):
                 label = f"{meaning} (sous-état)" if sub else meaning
@@ -358,6 +383,20 @@ def analyze_line(raw: str, state: Optional[str] = None) -> Optional[dict]:
             label = BLADE_HEIGHT_ERRORS.get(code, f"Code {code} non répertorié")
             return _r("Hauteur de coupe", "error", f"Erreur hauteur de coupe : {label}")
 
+    if "blade setspeed" in low:
+        m = _RE_BLADE_SPEED.search(raw)
+        if m:
+            consigne = abs(int(m.group(1)))
+            reelle = abs(int(m.group(3)))
+            if consigne and reelle < consigne * BLADE_MIN_RATIO:
+                return _r("Moteur de coupe", "warn",
+                          f"Moteur de coupe en difficulté "
+                          f"({reelle} tr/min pour {consigne} demandés)",
+                          "Herbe trop haute ou humide, lames émoussées, ou "
+                          "quelque chose d'enroulé autour de l'arbre de coupe",
+                          keys="lame coupe moteur bloque herbe haute couple")
+        return None
+
     if "blade setting changed" in low:
         return _r("Hauteur de coupe", "info",
                   "Hauteur de coupe modifiée par l'utilisateur")
@@ -384,13 +423,22 @@ def analyze_line(raw: str, state: Optional[str] = None) -> Optional[dict]:
         return _r("Bande magnétique", "info",
                   "Fin du guidage par la bande magnétique")
 
-    if "magnetic info" in low:
-        m = _RE_MAGNET_VAL.search(raw)
-        if m and int(m.group(1)) < 1500:
-            return _r("Bande magnétique", "warn",
-                      f"Signal bande magnétique faible ({m.group(1)} < 1500)",
-                      "> 1500 = OK, < 1500 = signal insuffisant")
-        return None  # valeurs normales : pas la peine d'encombrer le diagnostic
+    if "magnetic_info" in low or "magnetic info" in low:
+        # Le robot écrit « Mag Left:[577], Right:[708] ». Le guide de
+        # dépannage fixe le seuil à 1000 : en dessous, la bande est trop
+        # enfouie ou ce n'est pas la bonne.
+        m = _RE_MAGNET_PAIR.search(raw)
+        if m:
+            gauche, droite = int(m.group(1)), int(m.group(2))
+            if min(gauche, droite) < MAGNET_MIN:
+                return _r("Bande magnétique", "warn",
+                          f"Signal de bande magnétique faible "
+                          f"(gauche {gauche}, droite {droite} — il faut > {MAGNET_MIN})",
+                          "Bande enfouie à plus de 2,5 cm, posée à l'envers, "
+                          "ou bande de zone interdite utilisée par erreur",
+                          keys="bande magnetique faible signal accostage")
+            return None
+        return None  # message d'état sans valeur : rien à signaler
 
     if "ultrasound bump" in low:
         return _r("OAS (ultrasons)", "info", "Détection d'obstacle par ultrasons",
