@@ -74,6 +74,7 @@ class RobotSession:
     fmt: str = "rtk1"        # "rtk1" (ancien format) ou "rtk2"
     station_xy: tuple = None       # station de charge, si les logs la donnent
     station_heading: float = None  # cap de l'axe d'accostage, en degrés
+    robot_map: tuple = None        # (masque de la carte du robot, résolution m)
 
 
 def _parse_timestamp(s: str) -> Optional[datetime]:

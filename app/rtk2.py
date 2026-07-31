@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 import glob
+import json
 import math
 from datetime import datetime
 
@@ -67,10 +68,12 @@ def is_useful_member(name: str) -> bool:
         if stem.endswith(".1"):
             stem = stem[:-2]
         return stem in EVENT_LOGS
-    # descripteurs de carte : station de charge, résolution, progression
-    return base.endswith((".yaml", ".json")) and (
-        name.startswith("map/") or "/map/" in name
-    )
+    in_map = name.startswith("map/") or "/map/" in name
+    if not in_map:
+        return False
+    # descripteurs de carte + l'image de carte du robot. Surtout pas les
+    # centaines de captures de log/csvLog, qui ne servent à rien ici.
+    return base.endswith((".yaml", ".json")) or base == "time_map.png"
 
 
 def archive_is_rtk2(names) -> bool:
@@ -186,6 +189,43 @@ def read_station(folder: str):
     return (x, y), (yaw % 360.0) - 180.0     # demi-tour, puis ramené dans [-180, 180[
 
 
+def read_map_image(folder: str):
+    """Carte enregistrée par le robot lui-même (map/time_map.png) : chaque
+    case y garde la date de dernière tonte, 0 signifiant jamais tondue.
+
+    Le repère a été vérifié sur 400 recoupements entre les lignes
+    « current point [px, py] » et les positions du planificateur : le pixel
+    multiplié par la résolution donne les mètres, sans décalage ni symétrie
+    (écart moyen 6 cm). L'origine de l'image est donc (0, 0).
+
+    Renvoie (masque booléen des cases connues, résolution en m), ou None.
+    """
+    path = os.path.join(folder, "map", "time_map.png")
+    if not os.path.isfile(path):
+        return None
+    resolution = 0.08
+    info = os.path.join(folder, "map", "map_info.json")
+    if os.path.isfile(info):
+        try:
+            with open(info, "r", errors="ignore") as f:
+                data = json.load(f)
+            resolution = float(
+                data["time_map"]["time_map_info"]["time_map_resolution"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    try:
+        import numpy as np
+        from PIL import Image
+
+        with Image.open(path) as img:
+            arr = np.asarray(img.convert("L"))
+    except Exception:
+        return None      # Pillow absent ou image illisible : on s'en passe
+    if arr.ndim != 2 or arr.size == 0:
+        return None
+    return arr > 0, resolution
+
+
 def read_identity(folder: str, session) -> None:
     """Modèle et numéro de série : l'export ne contient pas d'en-tête comme
     en RTK1, mais le nom du dossier suit le motif MODELE_SERIE_date."""
@@ -213,4 +253,5 @@ def load(folder: str, session) -> None:
     for path in _event_files(log_dir):
         parse_file(path, session)
     session.station_xy, session.station_heading = read_station(root)
+    session.robot_map = read_map_image(root)
     read_identity(root, session)

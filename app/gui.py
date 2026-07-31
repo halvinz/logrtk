@@ -110,6 +110,7 @@ class TrackCanvas(FigureCanvas):
         self._view_pts: list[TrackPoint] = []
         self._station = None
         self._station_heading = None
+        self._robot_map = None
         self._show: dict = {}
         self._analysis_start: datetime | None = None
         self.on_point_clicked = None  # callback(TrackPoint), posé par MainWindow
@@ -201,6 +202,13 @@ class TrackCanvas(FigureCanvas):
         if self._station is not None:
             xs.append(self._station[0])
             ys.append(self._station[1])
+        if self._robot_map is not None:
+            # la carte du robot déborde souvent du trajet : on la cadre entière
+            mask, res = self._robot_map
+            ys_i, xs_i = np.nonzero(mask)
+            if xs_i.size:
+                xs += [float(xs_i.min()) * res, float(xs_i.max()) * res]
+                ys += [float(ys_i.min()) * res, float(ys_i.max()) * res]
         margin_x = max((max(xs) - min(xs)) * 0.08, 1.0)
         margin_y = max((max(ys) - min(ys)) * 0.08, 1.0)
         self.ax.set_xlim(min(xs) - margin_x, max(xs) + margin_x)
@@ -266,18 +274,37 @@ class TrackCanvas(FigureCanvas):
             return COL_TRANSIT
         return ZONE_COLORS[(zone - 1) % len(ZONE_COLORS)]
 
+    def _draw_robot_map(self, pale: bool):
+        """Carte enregistrée par le robot, dessinée telle quelle en fond.
+        Contrairement à la pelouse déduite du trajet, elle donne le contour
+        réel du terrain, y compris les parties non parcourues récemment."""
+        if self._robot_map is None:
+            return False
+        mask, res = self._robot_map
+        h, w = mask.shape
+        self.ax.imshow(
+            np.ma.masked_where(~mask, mask.astype(float)),
+            extent=(0.0, w * res, 0.0, h * res), origin="lower", aspect="auto",
+            cmap=ListedColormap([COL_LAWN_PALE if pale else COL_LAWN]),
+            interpolation="nearest", zorder=1,
+        )
+        return True
+
     def _draw_zone(self, pale: bool):
         """Pelouse entière en pâle, puis la tonte de la période affichée :
         une couleur par zone comme dans l'application du robot, et le couloir
         de liaison entre zones en clair."""
+        has_map = self._draw_robot_map(pale)
         if self._grid is None:
             # trace trop courte pour un quadrillage : on retombe sur des points
             self.ax.scatter([p.x for p in self._pts], [p.y for p in self._pts],
                             color=COL_ZONE_PALE if pale else COL_ZONE,
                             s=14, linewidths=0, zorder=2)
             return
-        self._fill(self._lawn_mask, COL_LAWN_PALE if pale else COL_LAWN,
-                   1.0, zorder=1)
+        if not has_map:
+            # pas de carte du robot : on retombe sur la pelouse déduite
+            self._fill(self._lawn_mask, COL_LAWN_PALE if pale else COL_LAWN,
+                       1.0, zorder=1)
         for zone in sorted(self._zone_masks):
             color = COL_ZONE_PALE if pale else self._zone_color(zone)
             # le couloir passe au-dessus : c'est lui qui relie les zones
@@ -405,7 +432,8 @@ class TrackCanvas(FigureCanvas):
                    station_intervals=None, zone_intervals=None,
                    magnetic_intervals=None, station_xy=None,
                    station_heading=None, show_forbidden: bool = True,
-                   show=None, all_points=None, zone_timeline=None):
+                   show=None, all_points=None, zone_timeline=None,
+                   robot_map=None):
         """`points` : la période affichée (vert franc).
         `all_points` : tout l'historique, qui définit l'étendue de la pelouse
         (vert pâle) — c'est ce contraste qui montre ce qui a été tondu."""
@@ -414,6 +442,7 @@ class TrackCanvas(FigureCanvas):
         self._show = show or {}
         self._station = station_xy
         self._station_heading = station_heading
+        self._robot_map = robot_map
 
         base = self._filter_points(all_points if all_points else points,
                                    filter_outliers)
@@ -623,7 +652,12 @@ class MainWindow(QMainWindow):
         self.chk_way_station = QCheckBox("Chemin station")
         self.chk_way_magnet = QCheckBox("Bande magnétique")
         self.chk_way_zone = QCheckBox("Chemin entre zones")
-        for chk in (self.chk_forbidden, self.chk_way_station,
+        self.chk_robot_map = QCheckBox("Carte du robot")
+        self.chk_robot_map.setToolTip(
+            "Contour réel enregistré par le robot, quand l'export le contient.\n"
+            "Décochez pour revenir au terrain déduit des déplacements."
+        )
+        for chk in (self.chk_robot_map, self.chk_forbidden, self.chk_way_station,
                     self.chk_way_magnet, self.chk_way_zone):
             chk.setChecked(True)
             chk.stateChanged.connect(self.refresh_track)
@@ -1368,6 +1402,7 @@ class MainWindow(QMainWindow):
             station_heading=self._station_heading,
             show_forbidden=self.chk_forbidden.isChecked(),
             zone_timeline=self._zone_timeline,
+            robot_map=self.session.robot_map if self.chk_robot_map.isChecked() else None,
             show={
                 "station": self.chk_way_station.isChecked(),
                 "magnet": self.chk_way_magnet.isChecked(),
