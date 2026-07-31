@@ -55,6 +55,7 @@ from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       station_approach, build_grid, rasterize,
                       zone_timeline, zones_of_points, state_timeline)
 from summary import describe
+from assistant import analyser, rediger
 
 # Fenêtre de regroupement des événements identiques dans l'onglet Diagnostic
 GROUP_SECONDS = 120
@@ -864,6 +865,33 @@ class MainWindow(QMainWindow):
         wrapper_layout.addStretch(1)
         self.tabs.addTab(info_wrapper, "Infos")
 
+        # Onglet assistant : diagnostic à partir du message du client
+        assistant_widget = QWidget()
+        assistant_layout = QVBoxLayout(assistant_widget)
+        assistant_layout.addWidget(QLabel(
+            "Collez le message du client. Le diagnostic croise ce qu'il "
+            "décrit, les journaux chargés et les guides de dépannage."
+        ))
+        self.txt_client = QTextEdit()
+        self.txt_client.setPlaceholderText(
+            "Bonjour, j'ai un souci avec un KR 101 E…"
+        )
+        self.txt_client.setMaximumHeight(150)
+        assistant_layout.addWidget(self.txt_client)
+        barre_assist = QHBoxLayout()
+        btn_diag = QPushButton("Établir le diagnostic")
+        btn_diag.clicked.connect(self.on_assistant)
+        barre_assist.addWidget(btn_diag)
+        btn_copier_diag = QPushButton("Copier la réponse")
+        btn_copier_diag.clicked.connect(self.on_copy_assistant)
+        barre_assist.addWidget(btn_copier_diag)
+        barre_assist.addStretch(1)
+        assistant_layout.addLayout(barre_assist)
+        self.txt_assistant = QTextEdit()
+        self.txt_assistant.setReadOnly(True)
+        assistant_layout.addWidget(self.txt_assistant, stretch=1)
+        self.tabs.addTab(assistant_widget, "Assistant")
+
         # Onglet diagnostic (Log bible)
         self.diag_widget = QWidget()
         diag_layout = QVBoxLayout(self.diag_widget)
@@ -1621,6 +1649,28 @@ class MainWindow(QMainWindow):
             % ("#c62828" if error else "#ef8c00")
         )
         self.lbl_alert.setVisible(True)
+
+    def on_assistant(self):
+        message = self.txt_client.toPlainText().strip()
+        if not message:
+            self.txt_assistant.setHtml(
+                "<p>Collez d'abord le message du client.</p>")
+            return
+        rapport = analyser(message, self.session, self._diag_events)
+        self.txt_assistant.setHtml(rediger(rapport))
+        if not rapport["journaux_charges"]:
+            self.statusBar().showMessage(
+                "Diagnostic établi sans journaux : chargez le log du robot "
+                "pour confirmer ou infirmer les symptômes."
+            )
+
+    def on_copy_assistant(self):
+        texte = self.txt_assistant.toPlainText().strip()
+        if not texte:
+            self.statusBar().showMessage("Aucun diagnostic à copier.")
+            return
+        QApplication.clipboard().setText(texte)
+        self.statusBar().showMessage("Diagnostic copié dans le presse-papiers.")
 
     def on_copy_info(self):
         """Copie la fiche du robot, prête à coller dans un ticket."""
