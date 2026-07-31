@@ -192,6 +192,14 @@ TAG_LABELS = {
 }
 
 
+def robot_categories() -> set:
+    """Catégories qui concernent réellement la tondeuse. Les journaux RTK2
+    remontent aussi quantité d'erreurs purement logicielles (disque plein,
+    parcours de répertoire, services internes) : elles restent affichées,
+    mais après les vraies pannes."""
+    return set(CATEGORY_KEYS) | set(TAG_LABELS.values())
+
+
 def analyze_rtk2_line(level: str, tag: str, text: str) -> Optional[dict]:
     """Diagnostic générique pour les robots RTK2, faute de bible dédiée :
     on remonte les lignes que le robot lui-même signale en WARN ou ERROR."""

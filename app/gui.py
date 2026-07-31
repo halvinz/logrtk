@@ -41,7 +41,7 @@ from matplotlib.colors import ListedColormap
 from parser import (load_session_from_folder, load_session, load_session_from_zip,
                     RobotSession, TrackPoint)
 from logbible import (analyze_line, analyze_rtk2_line, normalize,
-                      search_terms, SEARCH_CATALOG)
+                      robot_categories, search_terms, SEARCH_CATALOG)
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
                       build_grid, rasterize)
@@ -997,8 +997,11 @@ class MainWindow(QMainWindow):
         différents et l'onglet déborde (11 000 lignes sur un export RTK2)."""
         merged = {}
         for ts, ts_end, d, count, raw in events:
+            # Le message est tronqué en amont : deux variantes du même
+            # problème peuvent donc se terminer différemment. On ne compare
+            # qu'un début stable, chiffres neutralisés.
             sig = (d["severity"], d["category"],
-                   re.sub(r"\d+", "N", d["meaning"]))
+                   re.sub(r"\d+", "N", d["meaning"])[:80])
             hit = merged.get(sig)
             if hit is None:
                 merged[sig] = [ts, ts_end, d, count, raw]
@@ -1007,8 +1010,11 @@ class MainWindow(QMainWindow):
                 hit[1] = max(hit[1], ts_end)
                 hit[3] += count
         order = {"error": 0, "warn": 1, "info": 2}
+        robot = robot_categories()
+        # les pannes de la tondeuse d'abord, le bruit logiciel ensuite
         return sorted(merged.values(),
-                      key=lambda e: (order.get(e[2]["severity"], 3), -e[3]))
+                      key=lambda e: (0 if e[2]["category"] in robot else 1,
+                                     order.get(e[2]["severity"], 3), -e[3]))
 
     def display_diagnostic(self):
         """Affiche les événements déjà calculés, selon la recherche et le

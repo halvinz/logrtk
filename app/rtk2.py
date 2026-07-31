@@ -52,6 +52,32 @@ EVENT_LOGS = {
 MAX_FILE_BYTES = 40 * 1024 * 1024
 
 
+def is_useful_member(name: str) -> bool:
+    """Fichiers d'une archive qu'il vaut la peine d'extraire. Les exports
+    pèsent 450 Mo dont l'essentiel — télémétrie SLAM brute, dmesg, captures
+    PNG — n'est jamais lu : les sortir tous ralentirait l'ouverture pour rien.
+    """
+    name = name.replace("\\", "/")
+    if name.endswith("/"):
+        return False
+    base = name.rsplit("/", 1)[-1]
+    if name.endswith(".log"):
+        stem = base[:-4]
+        if stem.endswith(".1"):
+            stem = stem[:-2]
+        return stem in EVENT_LOGS
+    # descripteurs de carte : station de charge, résolution, progression
+    return base.endswith((".yaml", ".json")) and (
+        name.startswith("map/") or "/map/" in name
+    )
+
+
+def archive_is_rtk2(names) -> bool:
+    """Vrai si l'archive contient les journaux caractéristiques du RTK2."""
+    bases = {n.replace("\\", "/").rsplit("/", 1)[-1] for n in names}
+    return bool({"planner.log", "mower.log"} & bases)
+
+
 def looks_like_rtk2(folder: str) -> bool:
     """Vrai si le dossier ressemble à un export RTK2."""
     return bool(_log_dir(folder))

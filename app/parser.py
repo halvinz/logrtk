@@ -211,19 +211,24 @@ def load_session_from_zip(zip_path: str) -> RobotSession:
     longueur des chemins, autant le faire nous-mêmes."""
     import zipfile
     import tempfile
+    import rtk2
 
     target = os.path.join(tempfile.gettempdir(), "RobotLogViewer_extract",
                           os.path.splitext(os.path.basename(zip_path))[0])
     os.makedirs(target, exist_ok=True)
 
     with zipfile.ZipFile(zip_path) as z:
+        # une archive RTK1 ne contient que quelques journaux : on prend tout ;
+        # une archive RTK2 en contient 450 Mo dont on n'utilise qu'une part
+        rtk2_archive = rtk2.archive_is_rtk2(z.namelist())
         for info in z.infolist():
             if info.is_dir():
                 continue
             name = info.filename
-            # on ne sort que ce qui sert : journaux + descripteurs de carte
-            keep = name.endswith((".log", ".yaml", ".json", ".txt"))
-            if not keep or "/csvLog/" in name:
+            if rtk2_archive:
+                if not rtk2.is_useful_member(name):
+                    continue
+            elif not name.endswith((".log", ".txt")):
                 continue
             dest = os.path.join(target, *name.split("/"))
             try:
