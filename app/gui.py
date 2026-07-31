@@ -49,7 +49,8 @@ from plm import read_plm, KIND_AREA as PLM_AREA, KIND_ISLAND as PLM_ISLAND
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
                       station_approach, build_grid, rasterize,
-                      zone_timeline, zones_of_points)
+                      zone_timeline, zones_of_points, state_timeline)
+from summary import describe
 
 # Fenêtre de regroupement des événements identiques dans l'onglet Diagnostic
 GROUP_SECONDS = 120
@@ -839,6 +840,12 @@ class MainWindow(QMainWindow):
         # Onglet diagnostic (Log bible)
         self.diag_widget = QWidget()
         diag_layout = QVBoxLayout(self.diag_widget)
+        # Synthèse : ce qu'a fait le robot, puis la conclusion
+        self.txt_summary = QTextEdit()
+        self.txt_summary.setReadOnly(True)
+        self.txt_summary.setMaximumHeight(150)
+        diag_layout.addWidget(self.txt_summary)
+
         search_diag = QHBoxLayout()
         self.txt_diag_search = QLineEdit()
         self.txt_diag_search.setPlaceholderText(
@@ -1226,8 +1233,11 @@ class MainWindow(QMainWindow):
         self.lbl_boundary.setText(s.boundary_length or "-")
         self.txt_schedule.setPlainText("\n".join(s.schedule))
 
-        # Filtre de dates : bornes = première/dernière date valide trouvée
-        valid_ts = [p.ts for p in s.track] + [l.ts for l in s.lines if l.ts]
+        # Filtre de dates : bornes = première/dernière date valide trouvée.
+        # L'horloge du robot repart parfois en 2017 après une coupure : sans
+        # ce tri, le filtre démarrait sur une date aberrante.
+        valid_ts = [p.ts for p in s.track if p.ts.year >= 2020] + \
+                   [l.ts for l in s.lines if l.ts and l.ts.year >= 2020]
         if valid_ts:
             self.dt_start.setDateTime(min(valid_ts))
             self.dt_end.setDateTime(max(valid_ts))
@@ -1356,6 +1366,7 @@ class MainWindow(QMainWindow):
                 events.append([l.ts, l.ts, diag, 1, l.raw])
 
         self._diag_events = events
+        self.refresh_summary(events)
         # incidents à signaler pendant la lecture « Show time path »
         self._alerts = [(e[0], e[2]) for e in events
                         if e[2]["severity"] in ("error", "warn")]
@@ -1499,6 +1510,26 @@ class MainWindow(QMainWindow):
             % ("#c62828" if error else "#ef8c00")
         )
         self.lbl_alert.setVisible(True)
+
+    def refresh_summary(self, events):
+        """Remplit l'encadré de synthèse en tête du diagnostic."""
+        if not self.session:
+            return
+        lignes, conclusion, gravite = describe(
+            self.session, events, state_timeline(self.session.lines),
+            self.canvas.coverage(),
+            periode=(self.dt_start.dateTime().toPython(),
+                     self.dt_end.dateTime().toPython()),
+        )
+        couleur = {"error": "#c62828", "warn": "#b36b00"}.get(gravite, "#2e7d32")
+        titre = {"error": "⛔ Conclusion", "warn": "⚠ Conclusion"}.get(
+            gravite, "✔ Conclusion")
+        corps = "<br>".join(f"• {l}" for l in lignes)
+        self.txt_summary.setHtml(
+            f"<div style='font-size:12px'>{corps}"
+            f"<div style='margin-top:6px; color:{couleur}; font-weight:bold'>"
+            f"{titre} : {conclusion}</div></div>"
+        )
 
     def _summarize(self, events):
         """Rassemble toutes les occurrences d'un même problème en une ligne.
