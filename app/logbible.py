@@ -157,6 +157,55 @@ def _r(category, severity, meaning, conclusion="", keys=""):
             "conclusion": conclusion, "keys": all_keys}
 
 
+# --------------------------------------------------------------------------
+# Robots RTK2 : pas de « Log bible », mais chaque ligne porte sa gravité et
+# son module. On s'en sert directement, en écartant la plomberie logicielle
+# (bus de messages, threads système) qui n'apprend rien sur la tondeuse.
+# --------------------------------------------------------------------------
+TECH_TAGS = {
+    "DDS", "MSG", "SYS", "IPC", "MAJOR_IPC", "UTILS", "LOG", "MEM",
+    "DATABUS", "RTPS", "SHM", "TIMER", "THREAD",
+}
+
+TAG_LABELS = {
+    "MAPPING": "Cartographie",
+    "MAPCOM": "Carte",
+    "TASK": "Tâche en cours",
+    "PLAN_BRIGE": "Navigation",
+    "PLAN": "Navigation",
+    "PLANNER": "Navigation",
+    "MOWER": "Tonte",
+    "BLOCK": "Obstacle",
+    "PERCEP": "Perception",
+    "HMI": "Interface",
+    "NCM": "Réseau",
+    "NCMCOM": "Réseau",
+    "NTRIPCOM": "Signal RTK",
+    "IOT": "Connectivité",
+    "M3": "Carte électronique",
+    "FI": "Sécurité",
+    "SENSOR": "Capteurs",
+    "SLAM": "Localisation",
+    "UCM": "Pilotage",
+    "SSM": "États",
+    "EM": "Énergie",
+}
+
+
+def analyze_rtk2_line(level: str, tag: str, text: str) -> Optional[dict]:
+    """Diagnostic générique pour les robots RTK2, faute de bible dédiée :
+    on remonte les lignes que le robot lui-même signale en WARN ou ERROR."""
+    if level not in ("WARN", "ERROR"):
+        return None
+    tag = (tag or "").upper()
+    if tag in TECH_TAGS:
+        return None
+    category = TAG_LABELS.get(tag, tag.title() if tag else "Robot")
+    message = " ".join(text.split())[:150]
+    return _r(category, "error" if level == "ERROR" else "warn", message,
+              keys=tag.lower())
+
+
 def normalize(s: str) -> str:
     """Minuscules sans accents, pour une recherche tolérante."""
     s = unicodedata.normalize("NFD", s.lower())

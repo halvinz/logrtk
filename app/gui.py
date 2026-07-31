@@ -17,6 +17,7 @@ gui.py — Interface principale : Robot Log Viewer
 from __future__ import annotations
 
 import os
+import re
 import sys
 import bisect
 from datetime import datetime, time, timedelta
@@ -37,8 +38,10 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.colors import ListedColormap
 
-from parser import load_session_from_folder, load_session, RobotSession, TrackPoint
-from logbible import analyze_line, normalize, search_terms, SEARCH_CATALOG
+from parser import (load_session_from_folder, load_session, load_session_from_zip,
+                    RobotSession, TrackPoint)
+from logbible import (analyze_line, analyze_rtk2_line, normalize,
+                      search_terms, SEARCH_CATALOG)
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
                       build_grid, rasterize)
@@ -479,6 +482,7 @@ class MainWindow(QMainWindow):
         self._zone_intervals: list = []               # transferts vers une autre zone
         self._magnetic_intervals: list = []           # suivi de la bande magnétique
         self._station_xy = None                       # position réelle de la station
+        self._diag_events: list = []                  # diagnostic déjà calculé
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -488,10 +492,13 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout()
         self.btn_open_folder = QPushButton("Ouvrir un dossier de logs…")
         self.btn_open_folder.clicked.connect(self.on_open_folder)
+        self.btn_open_zip = QPushButton("Ouvrir une archive .zip…")
+        self.btn_open_zip.clicked.connect(self.on_open_zip)
         self.btn_open_files = QPushButton("Ouvrir des fichiers…")
         self.btn_open_files.clicked.connect(self.on_open_files)
         self.lbl_loaded = QLabel("Aucun fichier chargé.")
         top_bar.addWidget(self.btn_open_folder)
+        top_bar.addWidget(self.btn_open_zip)
         top_bar.addWidget(self.btn_open_files)
         top_bar.addWidget(self.lbl_loaded, stretch=1)
         root.addLayout(top_bar)
@@ -611,7 +618,7 @@ class MainWindow(QMainWindow):
         self.txt_diag_search.setPlaceholderText(
             "Rechercher une panne : évite un piège, patine, choc, pluie, rtk…"
         )
-        self.txt_diag_search.textChanged.connect(self.refresh_diagnostic)
+        self.txt_diag_search.textChanged.connect(self.display_diagnostic)
         search_diag.addWidget(self.txt_diag_search, stretch=1)
         btn_help = QPushButton("?")
         btn_help.setMaximumWidth(30)
@@ -623,8 +630,16 @@ class MainWindow(QMainWindow):
         diag_bar = QHBoxLayout()
         self.chk_diag_errors = QCheckBox("Erreurs et alertes uniquement")
         self.chk_diag_errors.setChecked(True)
-        self.chk_diag_errors.stateChanged.connect(self.refresh_diagnostic)
+        self.chk_diag_errors.stateChanged.connect(self.display_diagnostic)
         diag_bar.addWidget(self.chk_diag_errors)
+        self.chk_diag_group = QCheckBox("Regrouper les répétitions")
+        self.chk_diag_group.setChecked(True)
+        self.chk_diag_group.setToolTip(
+            "Une ligne par problème, avec le nombre d'occurrences et la période.\n"
+            "Décochez pour retrouver l'ordre chronologique des incidents."
+        )
+        self.chk_diag_group.stateChanged.connect(self.display_diagnostic)
+        diag_bar.addWidget(self.chk_diag_group)
         self.lbl_diag = QLabel("")
         diag_bar.addWidget(self.lbl_diag, stretch=1)
         diag_layout.addLayout(diag_bar)
@@ -807,6 +822,22 @@ class MainWindow(QMainWindow):
             return
         self._after_load(folder)
 
+    def on_open_zip(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choisir une archive de logs", "", "Archives (*.zip)"
+        )
+        if not path:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.session = load_session_from_zip(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Impossible de lire cette archive :\n{e}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._after_load(os.path.basename(path))
+
     def on_open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Choisir un ou plusieurs fichiers de logs", "",
@@ -875,7 +906,8 @@ class MainWindow(QMainWindow):
 
         self._station_intervals, self._zone_intervals = path_intervals(s.lines)
         self._magnetic_intervals = magnetic_intervals(s.lines)
-        self._station_xy = station_position(s.track, s.lines)
+        # en RTK2 la station est donnée par les logs ; sinon on la déduit
+        self._station_xy = s.station_xy or station_position(s.track, s.lines)
 
         # Liste des journées présentes dans la trace
         days = sorted({p.ts.date() for p in s.track if p.ts.year >= 2020})
@@ -917,7 +949,9 @@ class MainWindow(QMainWindow):
         self.refresh_diagnostic()
 
     def refresh_diagnostic(self):
-        """Analyse les logs avec la Log bible et remplit l'onglet Diagnostic."""
+        """Recalcule les événements puis rafraîchit l'affichage. Coûteux :
+        n'est appelé qu'au chargement ou quand un filtre change, jamais à
+        chaque frappe dans la recherche (les logs RTK2 font 800 000 lignes)."""
         if not self.session:
             return
         start = self.dt_start.dateTime().toPython()
@@ -926,7 +960,7 @@ class MainWindow(QMainWindow):
         # Une rafale du même problème (chocs, patinage, 4G…) devient une seule
         # ligne « ×N, de hh:mm:ss à hh:mm:ss » : sinon l'onglet est illisible.
         BURST = timedelta(seconds=GROUP_SECONDS)
-        events = []  # [ts_debut, ts_fin, diag, count]
+        events = []  # [ts_debut, ts_fin, diag, count, raw]
         state = None
         for l in self.session.lines:
             if l.ts is None:
@@ -937,6 +971,10 @@ class MainWindow(QMainWindow):
             if not (start <= l.ts <= end):
                 continue
             diag = analyze_line(l.raw, state)
+            if diag is None and self.session.fmt == "rtk2":
+                # pas de bible pour ce modèle : on se fie à la gravité que
+                # le robot inscrit lui-même dans ses journaux
+                diag = analyze_rtk2_line(l.level, l.tag, l.text)
             if diag is None:
                 continue
             # On regroupe sur le libellé exact (et non la seule catégorie) :
@@ -949,8 +987,39 @@ class MainWindow(QMainWindow):
             else:
                 events.append([l.ts, l.ts, diag, 1, l.raw])
 
+        self._diag_events = events
+        self.display_diagnostic()
+
+    def _summarize(self, events):
+        """Rassemble toutes les occurrences d'un même problème en une ligne.
+        Les nombres du message sont ignorés dans la comparaison : sans cela
+        « region id[1] » et « region id[5] » comptent pour deux problèmes
+        différents et l'onglet déborde (11 000 lignes sur un export RTK2)."""
+        merged = {}
+        for ts, ts_end, d, count, raw in events:
+            sig = (d["severity"], d["category"],
+                   re.sub(r"\d+", "N", d["meaning"]))
+            hit = merged.get(sig)
+            if hit is None:
+                merged[sig] = [ts, ts_end, d, count, raw]
+            else:
+                hit[0] = min(hit[0], ts)
+                hit[1] = max(hit[1], ts_end)
+                hit[3] += count
+        order = {"error": 0, "warn": 1, "info": 2}
+        return sorted(merged.values(),
+                      key=lambda e: (order.get(e[2]["severity"], 3), -e[3]))
+
+    def display_diagnostic(self):
+        """Affiche les événements déjà calculés, selon la recherche et le
+        mode de regroupement choisis."""
+        if not self.session:
+            return
+        events = self._diag_events
         n_err = sum(1 for e in events if e[2]["severity"] == "error")
         n_warn = sum(1 for e in events if e[2]["severity"] == "warn")
+        if self.chk_diag_group.isChecked():
+            events = self._summarize(events)
 
         # Recherche de panne : tous les mots tapés doivent se retrouver dans la
         # description, la solution, les synonymes français ou la ligne de log.
@@ -970,7 +1039,9 @@ class MainWindow(QMainWindow):
                 continue
             text = f"{ts:%d/%m %H:%M:%S}   [{d['category']}]  {d['meaning']}"
             if count > 1:
-                text += f"  (×{count} jusqu'à {ts_end:%H:%M:%S})"
+                fin = (f"{ts_end:%H:%M:%S}" if ts_end.date() == ts.date()
+                       else f"{ts_end:%d/%m %H:%M:%S}")
+                text += f"  (×{count} jusqu'à {fin})"
             if d["conclusion"]:
                 text += f"\n        → {d['conclusion']}"
             item = QListWidgetItem(text)

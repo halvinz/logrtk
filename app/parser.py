@@ -53,6 +53,7 @@ class LogLine:
     text: str
     raw: str
     source: str  # nom du fichier d'origine
+    tag: str = ""  # module émetteur (logs RTK2 : TASK, MAPPING, HMI…)
 
 
 @dataclass
@@ -70,6 +71,8 @@ class RobotSession:
     track: list = field(default_factory=list)      # list[TrackPoint]
     lines: list = field(default_factory=list)       # list[LogLine]
     files_loaded: list = field(default_factory=list)
+    fmt: str = "rtk1"        # "rtk1" (ancien format) ou "rtk2"
+    station_xy: tuple = None  # station de charge, si les logs la donnent
 
 
 def _parse_timestamp(s: str) -> Optional[datetime]:
@@ -188,5 +191,46 @@ def load_session(main=None, pos=None, path=None, boot=None, dmesg=None) -> Robot
 
 
 def load_session_from_folder(folder: str) -> RobotSession:
+    """Charge un dossier de logs, quel que soit le format du robot."""
+    import rtk2
+
+    if rtk2.looks_like_rtk2(folder):
+        session = RobotSession()
+        rtk2.load(folder, session)
+        session.track.sort(key=lambda p: p.ts)
+        session.lines.sort(key=lambda l: (l.ts is None, l.ts))
+        return session
+
     files = autodetect_files(folder)
     return load_session(**files)
+
+
+def load_session_from_zip(zip_path: str) -> RobotSession:
+    """Charge directement une archive d'export (.zip), sans décompression
+    manuelle : l'Explorateur Windows échoue sur ces archives à cause de la
+    longueur des chemins, autant le faire nous-mêmes."""
+    import zipfile
+    import tempfile
+
+    target = os.path.join(tempfile.gettempdir(), "RobotLogViewer_extract",
+                          os.path.splitext(os.path.basename(zip_path))[0])
+    os.makedirs(target, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            # on ne sort que ce qui sert : journaux + descripteurs de carte
+            keep = name.endswith((".log", ".yaml", ".json", ".txt"))
+            if not keep or "/csvLog/" in name:
+                continue
+            dest = os.path.join(target, *name.split("/"))
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with z.open(info) as src, open(dest, "wb") as out:
+                    out.write(src.read())
+            except OSError:
+                continue  # nom de fichier impossible sous Windows : on l'ignore
+
+    return load_session_from_folder(target)
