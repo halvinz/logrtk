@@ -1048,6 +1048,28 @@ class MainWindow(QMainWindow):
         )
 
         self.refresh_view()
+        self._warn_if_no_track()
+
+    def _warn_if_no_track(self):
+        """Sans position, la carte reste vide : mieux vaut dire pourquoi que
+        laisser croire à un défaut du logiciel."""
+        if not self.session or self.session.track:
+            return
+        cause = ""
+        # le résumé classe déjà les pannes du robot en tête, par gravité
+        for _ts, _end, d, count, _raw in self._summarize(self._diag_events):
+            if d["severity"] == "error":
+                cause = f"\n\nPiste la plus probable :\n{d['meaning']} ({count} fois)"
+                if d["conclusion"]:
+                    cause += f"\n→ {d['conclusion']}"
+                break
+        QMessageBox.information(
+            self, "Aucune position dans ces logs",
+            "Le robot n'a enregistré aucune position sur cette période : "
+            "la carte reste donc vide.\n\nL'onglet Diagnostic reste "
+            "exploitable et contient les erreurs remontées par le robot."
+            + cause
+        )
 
     # ------------------------------------------------------------------
     # Rafraîchissement

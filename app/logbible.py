@@ -189,6 +189,7 @@ TAG_LABELS = {
     "UCM": "Pilotage",
     "SSM": "États",
     "EM": "Énergie",
+    "SYSTEM": "Système",
 }
 
 
@@ -200,11 +201,56 @@ def robot_categories() -> set:
     return set(CATEGORY_KEYS) | set(TAG_LABELS.values())
 
 
+# Messages RTK2 rencontrés sur le terrain, traduits en clair. La liste est
+# volontairement courte : tout le reste passe par la règle générique.
+RTK2_RULES = [
+    ("load_calibration_error", "Localisation", "error",
+     "Calibration SLAM impossible à charger",
+     "Fichier /app/data/slam/calibration_config.yaml absent ou illisible — "
+     "le robot ne peut alors pas se localiser du tout",
+     "calibration configuration fichier manquant absent illisible"),
+    ("calibration config failed", "Localisation", "error",
+     "Calibration SLAM impossible à charger",
+     "Fichier /app/data/slam/calibration_config.yaml absent ou illisible — "
+     "le robot ne peut alors pas se localiser du tout",
+     "calibration configuration fichier manquant absent illisible"),
+    ("load calibration configs failed", "Localisation", "error",
+     "Calibration SLAM impossible à charger",
+     "Fichier /app/data/slam/calibration_config.yaml absent ou illisible — "
+     "le robot ne peut alors pas se localiser du tout",
+     "calibration configuration fichier manquant absent illisible"),
+    ("get global pose fail", "Localisation", "error",
+     "Le robot n'arrive pas à se localiser (position indisponible)",
+     "Conséquence plutôt que cause : chercher d'abord une erreur de "
+     "calibration, de carte ou de signal RTK au même moment",
+     "localisation position perdue rtk gps carte tondre pas"),
+    ("need calibration", "Localisation", "error",
+     "Le SLAM réclame une calibration",
+     "À refaire depuis l'application avant toute tonte", "calibration slam"),
+    ("point too much", "Cartographie", "warn",
+     "Trop de points dans la carte SLAM", "", "carte slam points"),
+    ("space not enough", "Système", "warn",
+     "Espace disque insuffisant sur le robot",
+     "Les journaux et images finissent par ne plus être enregistrés",
+     "disque espace memoire plein"),
+    ("failed to read plm", "Carte", "warn",
+     "Fichier de carte (.plm) illisible",
+     "La carte enregistrée est peut-être corrompue", "carte plm fichier"),
+    ("narrow channel", "Navigation", "warn",
+     "Passage étroit détecté sur le trajet", "", "passage etroit couloir"),
+]
+
+
 def analyze_rtk2_line(level: str, tag: str, text: str) -> Optional[dict]:
-    """Diagnostic générique pour les robots RTK2, faute de bible dédiée :
-    on remonte les lignes que le robot lui-même signale en WARN ou ERROR."""
+    """Diagnostic pour les robots RTK2, faute de bible dédiée : quelques
+    messages parlants sont traduits, et pour tout le reste on se fie à la
+    gravité que le robot inscrit lui-même dans ses journaux."""
     if level not in ("WARN", "ERROR"):
         return None
+    low = text.lower()
+    for needle, cat, sev, meaning, concl, keys in RTK2_RULES:
+        if needle in low:
+            return _r(cat, sev, meaning, concl, keys=keys)
     tag = (tag or "").upper()
     if tag in TECH_TAGS:
         return None
