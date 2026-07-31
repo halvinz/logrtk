@@ -4,12 +4,9 @@ Analyse les fichiers de logs exportés par le robot (tondeuse Positec/Kress
 et compatibles) : fichier principal ..._MODEL.log, ..._pos.log, ..._boot.log,
 dmesg.txt.
 
-Le format des fichiers .plm (carte / zones tondues) est un format binaire
-propriétaire non documenté (entête custom + données à très haute entropie,
-probablement compressées/chiffrées). Il n'est pas géré ici : on reconstruit
-le tracé du robot directement à partir des positions SLAM loguées, ce qui
-donne un résultat visuellement très proche du tracé affiché par l'outil
-d'origine.
+Le tracé du robot est reconstruit à partir des positions SLAM loguées.
+La carte .plm, elle, est lue par le module `plm` : contrairement à ce qu'on
+croyait, elle n'est pas chiffrée mais simplement compressée.
 """
 
 from __future__ import annotations

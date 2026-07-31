@@ -45,6 +45,7 @@ from parser import (load_session_from_folder, load_session,
 from logbible import (analyze_line, analyze_rtk2_line, normalize,
                       robot_categories, search_terms, SEARCH_CATALOG)
 from geoexport import Georef, build_kml, maps_url
+from plm import read_plm, KIND_AREA as PLM_AREA, KIND_ISLAND as PLM_ISLAND
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
                       station_approach, build_grid, rasterize,
@@ -75,6 +76,7 @@ COL_WAY_STATION = "#111111"  # chemin vers la station : traits noirs
 COL_WAY_ZONE = "#7fdc9c"     # chemin vers une autre zone : vert clair
 COL_WAY_MAGNET = "#7e57c2"   # suivi de la bande magnétique : violet
 COL_UNMOWED = "#dcdcdc"      # poches non tondues à l'intérieur du terrain
+COL_ISLAND = "#5a5a5a"       # îlots de la carte .plm (massif, arbre, bassin)
 COL_ALERT_ERROR = "#c62828"  # repère d'erreur en mode analyse
 COL_ALERT_WARN = "#ef8c00"
 
@@ -113,6 +115,7 @@ class TrackCanvas(FigureCanvas):
         self._station = None
         self._station_heading = None
         self._robot_map = None
+        self._plm = None
         self._show: dict = {}
         self._analysis_start: datetime | None = None
         self.on_point_clicked = None  # callback(TrackPoint), posé par MainWindow
@@ -211,6 +214,11 @@ class TrackCanvas(FigureCanvas):
             if xs_i.size:
                 xs += [float(xs_i.min()) * res, float(xs_i.max()) * res]
                 ys += [float(ys_i.min()) * res, float(ys_i.max()) * res]
+        if self._plm is not None:
+            res = self._plm.resolution
+            for layer in self._plm.layers_of(PLM_AREA):
+                xs += [layer.x0 * res, (layer.x0 + layer.width) * res]
+                ys += [layer.y0 * res, (layer.y0 + layer.height) * res]
         margin_x = max((max(xs) - min(xs)) * 0.08, 1.0)
         margin_y = max((max(ys) - min(ys)) * 0.08, 1.0)
         self.ax.set_xlim(min(xs) - margin_x, max(xs) + margin_x)
@@ -276,6 +284,35 @@ class TrackCanvas(FigureCanvas):
             return COL_TRANSIT
         return ZONE_COLORS[(zone - 1) % len(ZONE_COLORS)]
 
+    def _draw_plm(self, pale: bool):
+        """Carte .plm du robot : surface de tonte réelle et îlots.
+        C'est le contour officiel, avec ses obstacles — ce que les autres
+        couches ne peuvent que déduire du trajet."""
+        if self._plm is None:
+            return False
+        res = self._plm.resolution
+        drawn = False
+        for layer in self._plm.layers:
+            if layer.kind not in (PLM_AREA, PLM_ISLAND):
+                continue
+            arr = layer.to_array()
+            if arr is None:
+                continue
+            h, w = arr.shape
+            left, bottom = layer.x0 * res, layer.y0 * res
+            island = layer.kind == PLM_ISLAND
+            color = COL_ISLAND if island else (COL_LAWN_PALE if pale else COL_LAWN)
+            self.ax.imshow(
+                np.ma.masked_where(~arr, arr.astype(float)),
+                extent=(left, left + w * res, bottom, bottom + h * res),
+                origin="lower", aspect="auto",
+                cmap=ListedColormap([color]),
+                alpha=0.5 if (pale and island) else 1.0,
+                interpolation="nearest", zorder=5 if island else 0,
+            )
+            drawn = True
+        return drawn
+
     def _draw_robot_map(self, pale: bool):
         """Carte enregistrée par le robot, dessinée telle quelle en fond.
         Contrairement à la pelouse déduite du trajet, elle donne le contour
@@ -296,7 +333,7 @@ class TrackCanvas(FigureCanvas):
         """Pelouse entière en pâle, puis la tonte de la période affichée :
         une couleur par zone comme dans l'application du robot, et le couloir
         de liaison entre zones en clair."""
-        has_map = self._draw_robot_map(pale)
+        has_map = self._draw_plm(pale) | self._draw_robot_map(pale)
         if self._grid is None:
             # trace trop courte pour un quadrillage : on retombe sur des points
             self.ax.scatter([p.x for p in self._pts], [p.y for p in self._pts],
@@ -395,6 +432,9 @@ class TrackCanvas(FigureCanvas):
         if self._unmowed is not None:
             handles.append(Line2D([], [], marker="s", linestyle="",
                                   color=COL_UNMOWED, label="Non tondu"))
+        if self._plm is not None and self._plm.layers_of(PLM_ISLAND):
+            handles.append(Line2D([], [], marker="s", linestyle="",
+                                  color=COL_ISLAND, label="Îlot / obstacle"))
         if self._show.get("station", True) and self._runs(1):
             handles.append(Line2D([], [], color=COL_WAY_STATION,
                                   linestyle=(0, (5, 3)), linewidth=1.8,
@@ -435,7 +475,7 @@ class TrackCanvas(FigureCanvas):
                    magnetic_intervals=None, station_xy=None,
                    station_heading=None, show_forbidden: bool = True,
                    show=None, all_points=None, zone_timeline=None,
-                   robot_map=None):
+                   robot_map=None, plm_map=None):
         """`points` : la période affichée (vert franc).
         `all_points` : tout l'historique, qui définit l'étendue de la pelouse
         (vert pâle) — c'est ce contraste qui montre ce qui a été tondu."""
@@ -445,6 +485,7 @@ class TrackCanvas(FigureCanvas):
         self._station = station_xy
         self._station_heading = station_heading
         self._robot_map = robot_map
+        self._plm = plm_map
 
         base = self._filter_points(all_points if all_points else points,
                                    filter_outliers)
@@ -593,6 +634,7 @@ class MainWindow(QMainWindow):
         self._zone_intervals: list = []               # transferts vers une autre zone
         self._magnetic_intervals: list = []           # suivi de la bande magnétique
         self._zone_timeline: list = []                # zone de tonte au fil du temps
+        self._plm_map = None                          # carte .plm jointe
         self._station_xy = None                       # position réelle de la station
         self._diag_events: list = []                  # diagnostic déjà calculé
         self._alerts: list = []                       # (ts, diag) erreurs et alertes
@@ -612,11 +654,18 @@ class MainWindow(QMainWindow):
         self.btn_open_zip = QPushButton("Ouvrir une archive…")
         self.btn_open_zip.setToolTip("Export du robot : .tar.gz (RTK1) ou .zip (RTK2)")
         self.btn_open_zip.clicked.connect(self.on_open_zip)
+        self.btn_open_plm = QPushButton("Joindre une carte .plm…")
+        self.btn_open_plm.setToolTip(
+            "Carte téléchargée depuis le robot : contour réel du terrain\n"
+            "et îlots (massifs, arbres, bassins)."
+        )
+        self.btn_open_plm.clicked.connect(self.on_open_plm)
         self.btn_open_files = QPushButton("Ouvrir des fichiers…")
         self.btn_open_files.clicked.connect(self.on_open_files)
         self.lbl_loaded = QLabel("Aucun fichier chargé.")
         top_bar.addWidget(self.btn_open_folder)
         top_bar.addWidget(self.btn_open_zip)
+        top_bar.addWidget(self.btn_open_plm)
         top_bar.addWidget(self.btn_open_files)
         top_bar.addWidget(self.lbl_loaded, stretch=1)
         root.addLayout(top_bar)
@@ -1062,6 +1111,34 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self._after_load(os.path.basename(path))
 
+    def on_open_plm(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choisir une carte du robot", "", "Carte du robot (*.plm)"
+        )
+        if not path:
+            return
+        try:
+            carte = read_plm(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Lecture impossible :\n{e}")
+            return
+        if carte is None:
+            QMessageBox.warning(self, "Format non reconnu",
+                                "Ce fichier n'est pas une carte .plm du robot.")
+            return
+        self._plm_map = carte
+        self.chk_robot_map.setChecked(True)
+        self.refresh_track()
+        note = ""
+        if self.session and self.session.track:
+            note = ("\n\nSi le contour ne tombe pas sur le trajet, c'est que "
+                    "cette carte appartient à un autre robot ou à une autre "
+                    "version du terrain.")
+        QMessageBox.information(
+            self, "Carte chargée",
+            f"{os.path.basename(path)}\n\n{carte.summary()}{note}"
+        )
+
     def on_open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Choisir un ou plusieurs fichiers de logs", "",
@@ -1499,6 +1576,7 @@ class MainWindow(QMainWindow):
             show_forbidden=self.chk_forbidden.isChecked(),
             zone_timeline=self._zone_timeline,
             robot_map=self.session.robot_map if self.chk_robot_map.isChecked() else None,
+            plm_map=self._plm_map if self.chk_robot_map.isChecked() else None,
             show={
                 "station": self.chk_way_station.isChecked(),
                 "magnet": self.chk_way_magnet.isChecked(),
