@@ -206,17 +206,57 @@ def load_session_from_folder(folder: str) -> RobotSession:
     return load_session(**files)
 
 
-def load_session_from_zip(zip_path: str) -> RobotSession:
-    """Charge directement une archive d'export (.zip), sans décompression
-    manuelle : l'Explorateur Windows échoue sur ces archives à cause de la
-    longueur des chemins, autant le faire nous-mêmes."""
-    import zipfile
+def load_session_from_archive(path: str) -> RobotSession:
+    """Charge une archive d'export sans décompression manuelle.
+
+    Deux formats selon la génération : le robot RTK1 produit un .tar.gz,
+    le RTK2 un .zip. Ce dernier fait échouer l'Explorateur Windows à cause
+    de la longueur des chemins, autant s'en charger nous-mêmes.
+    """
+    import tarfile
+
+    if tarfile.is_tarfile(path):
+        return _load_from_tar(path)
+    return _load_from_zip(path)
+
+
+def _extract_dir(path: str) -> str:
     import tempfile
+
+    name = os.path.basename(path)
+    for suffix in (".tar.gz", ".tgz", ".tar", ".zip"):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    target = os.path.join(tempfile.gettempdir(), "RobotLogViewer_extract", name)
+    os.makedirs(target, exist_ok=True)
+    return target
+
+
+def _load_from_tar(tar_path: str) -> RobotSession:
+    import tarfile
+
+    target = _extract_dir(tar_path)
+    with tarfile.open(tar_path) as t:
+        for member in t.getmembers():
+            if not member.isfile():
+                continue
+            if not member.name.endswith((".log", ".txt")):
+                continue
+            src = t.extractfile(member)
+            if src is None:
+                continue
+            dest = os.path.join(target, os.path.basename(member.name))
+            with src, open(dest, "wb") as out:
+                out.write(src.read())
+    return load_session_from_folder(target)
+
+
+def _load_from_zip(zip_path: str) -> RobotSession:
+    import zipfile
     import rtk2
 
-    target = os.path.join(tempfile.gettempdir(), "RobotLogViewer_extract",
-                          os.path.splitext(os.path.basename(zip_path))[0])
-    os.makedirs(target, exist_ok=True)
+    target = _extract_dir(zip_path)
 
     with zipfile.ZipFile(zip_path) as z:
         # une archive RTK1 ne contient que quelques journaux : on prend tout ;

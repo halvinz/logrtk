@@ -227,12 +227,24 @@ def station_approach(points, lines, station, max_dist=8.0):
                 bearings.append(math.atan2(p.y - sy, p.x - sx))
     if len(bearings) < 2:
         return None
-    # moyenne circulaire : une simple moyenne se tromperait autour de ±180°
-    mx = sum(math.cos(b) for b in bearings) / len(bearings)
-    my = sum(math.sin(b) for b in bearings) / len(bearings)
-    if mx == 0 and my == 0:
+
+    def circular_mean(values):
+        # une moyenne arithmétique se tromperait de tout autour de ±180°
+        mx = sum(math.cos(b) for b in values) / len(values)
+        my = sum(math.sin(b) for b in values) / len(values)
+        return None if (mx == 0 and my == 0) else math.atan2(my, mx)
+
+    mean = circular_mean(bearings)
+    if mean is None:
         return None
-    return math.degrees(math.atan2(my, mx))
+    # Certaines approches partent de travers (le robot manœuvre encore) :
+    # on écarte celles qui s'éloignent trop, puis on refait la moyenne.
+    close = [b for b in bearings
+             if abs(math.degrees(math.atan2(math.sin(b - mean),
+                                            math.cos(b - mean)))) <= 45]
+    if len(close) >= 2:
+        mean = circular_mean(close) or mean
+    return math.degrees(mean)
 
 
 def classify_points(points, station_intervals, zone_intervals,

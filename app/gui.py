@@ -39,8 +39,8 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.colors import ListedColormap
 
-from parser import (load_session_from_folder, load_session, load_session_from_zip,
-                    RobotSession, TrackPoint)
+from parser import (load_session_from_folder, load_session,
+                    load_session_from_archive, RobotSession, TrackPoint)
 from logbible import (analyze_line, analyze_rtk2_line, normalize,
                       robot_categories, search_terms, SEARCH_CATALOG)
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
@@ -542,7 +542,8 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout()
         self.btn_open_folder = QPushButton("Ouvrir un dossier de logs…")
         self.btn_open_folder.clicked.connect(self.on_open_folder)
-        self.btn_open_zip = QPushButton("Ouvrir une archive .zip…")
+        self.btn_open_zip = QPushButton("Ouvrir une archive…")
+        self.btn_open_zip.setToolTip("Export du robot : .tar.gz (RTK1) ou .zip (RTK2)")
         self.btn_open_zip.clicked.connect(self.on_open_zip)
         self.btn_open_files = QPushButton("Ouvrir des fichiers…")
         self.btn_open_files.clicked.connect(self.on_open_files)
@@ -942,13 +943,14 @@ class MainWindow(QMainWindow):
 
     def on_open_zip(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Choisir une archive de logs", "", "Archives (*.zip)"
+            self, "Choisir une archive de logs", "",
+            "Archives de logs (*.zip *.tar.gz *.tgz *.tar);;Tous les fichiers (*)"
         )
         if not path:
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self.session = load_session_from_zip(path)
+            self.session = load_session_from_archive(path)
         except Exception as e:
             QMessageBox.critical(self, "Erreur", f"Impossible de lire cette archive :\n{e}")
             return
