@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QLineEdit, QComboBox, QListWidget,
     QListWidgetItem, QSplitter, QGroupBox, QFormLayout, QDateTimeEdit,
     QCheckBox, QStatusBar, QMessageBox, QTabWidget, QTextEdit,
-    QAbstractItemView, QInputDialog
+    QAbstractItemView, QInputDialog, QDialog
 )
 from PySide6.QtGui import QColor
 
@@ -46,7 +46,7 @@ from logbible import (analyze_line, analyze_rtk2_line, normalize,
                       robot_categories, search_terms, SEARCH_CATALOG)
 from geoexport import Georef, build_kml, maps_url
 from plm import read_plm, KIND_AREA as PLM_AREA, KIND_ISLAND as PLM_ISLAND
-from portal import read_status
+from portal import read_status_text
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
                       station_approach, build_grid, rasterize,
@@ -844,7 +844,22 @@ class MainWindow(QMainWindow):
         self.txt_schedule.setReadOnly(True)
         self.txt_schedule.setMaximumHeight(140)
         form.addRow("Planning :", self.txt_schedule)
-        self.tabs.addTab(info_box, "Infos")
+
+        # les champs sont sélectionnables un par un, mais on a le plus souvent
+        # besoin de tout coller d'un coup dans un ticket ou un courriel
+        for label in (self.lbl_model, self.lbl_serial, self.lbl_firmware,
+                      self.lbl_export_date):
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.btn_copy_info = QPushButton("Copier les informations")
+        self.btn_copy_info.clicked.connect(self.on_copy_info)
+        form.addRow("", self.btn_copy_info)
+
+        info_wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(info_wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        wrapper_layout.addWidget(info_box)
+        wrapper_layout.addStretch(1)
+        self.tabs.addTab(info_wrapper, "Infos")
 
         # Onglet diagnostic (Log bible)
         self.diag_widget = QWidget()
@@ -1190,16 +1205,54 @@ class MainWindow(QMainWindow):
         )
 
     def on_open_portal(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Choisir un état du portail", "", "État MQTT (*.json)"
-        )
-        if not path:
+        """L'état se colle directement depuis le portail : ouvrir un fichier
+        obligerait à l'enregistrer d'abord."""
+        boite = QDialog(self)
+        boite.setWindowTitle("État du portail")
+        boite.resize(700, 460)
+        mise_en_page = QVBoxLayout(boite)
+        mise_en_page.addWidget(QLabel(
+            "Collez ici le message d'état du portail (Ctrl+V).\n"
+            "Le texte autour du JSON — ligne « Status », horodatage MQTT, "
+            "balises de code — est ignoré."
+        ))
+        zone = QTextEdit()
+        zone.setStyleSheet("font-family: monospace; font-size: 11px;")
+        zone.setPlainText(QApplication.clipboard().text())
+        mise_en_page.addWidget(zone, stretch=1)
+
+        boutons = QHBoxLayout()
+        depuis_fichier = QPushButton("Depuis un fichier…")
+        boutons.addWidget(depuis_fichier)
+        boutons.addStretch(1)
+        valider = QPushButton("Analyser")
+        valider.setDefault(True)
+        annuler = QPushButton("Annuler")
+        boutons.addWidget(valider)
+        boutons.addWidget(annuler)
+        mise_en_page.addLayout(boutons)
+
+        def charger_fichier():
+            chemin, _ = QFileDialog.getOpenFileName(
+                boite, "Choisir un état du portail", "", "État MQTT (*.json)")
+            if chemin:
+                try:
+                    with open(chemin, "r", encoding="utf-8", errors="ignore") as f:
+                        zone.setPlainText(f.read())
+                except OSError as e:
+                    QMessageBox.critical(boite, "Erreur", str(e))
+
+        depuis_fichier.clicked.connect(charger_fichier)
+        valider.clicked.connect(boite.accept)
+        annuler.clicked.connect(boite.reject)
+        if boite.exec() != QDialog.Accepted:
             return
-        resultat = read_status(path)
+
+        resultat = read_status_text(zone.toPlainText())
         if resultat is None:
             QMessageBox.warning(
-                self, "Format non reconnu",
-                "Ce fichier n'est pas un message d'état du portail.\n\n"
+                self, "État non reconnu",
+                "Ce texte n'est pas un message d'état du portail.\n\n"
                 "Attendu : le JSON contenant les blocs « cfg » et « dat »."
             )
             return
@@ -1551,6 +1604,32 @@ class MainWindow(QMainWindow):
             % ("#c62828" if error else "#ef8c00")
         )
         self.lbl_alert.setVisible(True)
+
+    def on_copy_info(self):
+        """Copie la fiche du robot, prête à coller dans un ticket."""
+        champs = [
+            ("Modèle", self.lbl_model), ("Numéro de série", self.lbl_serial),
+            ("Firmware", self.lbl_firmware), ("Date d'export", self.lbl_export_date),
+            ("Recharges batterie", self.lbl_battery),
+            ("Temps de lame", self.lbl_blade),
+            ("Temps de travail total", self.lbl_worktime),
+            ("Distance totale", self.lbl_distance),
+            ("Longueur de la bordure", self.lbl_boundary),
+        ]
+        lignes = [f"{nom} : {w.text()}" for nom, w in champs
+                  if w.text() not in ("", "-")]
+        planning = self.txt_schedule.toPlainText().strip()
+        if planning:
+            lignes.append("Planning :\n" + planning)
+        if self._portal:
+            lignes.append("")
+            lignes.extend(self._portal[0])
+        if not lignes:
+            self.statusBar().showMessage("Aucune information à copier.")
+            return
+        QApplication.clipboard().setText("\n".join(lignes))
+        self.statusBar().showMessage(
+            f"{len(lignes)} ligne(s) copiées dans le presse-papiers.")
 
     def _portal_events(self) -> list:
         """Constats de l'état du portail, présentés comme des incidents pour

@@ -32,12 +32,33 @@ def _f(diag_cat, gravite, message, conseil="", keys=""):
 
 
 def read_status(path: str):
-    """Lit un état du portail. Renvoie (infos, constats) ou None si le
-    fichier n'a pas cette forme."""
+    """Lit un état du portail depuis un fichier."""
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
+            return read_status_text(f.read())
+    except OSError:
+        return None
+
+
+def read_status_text(text: str):
+    """Lit un état du portail collé tel quel. Tolère ce qui entoure souvent
+    un copier-coller depuis le portail : clôture Markdown, ligne « Status »,
+    horodatage MQTT."""
+    if not text or not text.strip():
+        return None
+    extrait = text.strip()
+    if "```" in extrait:
+        morceaux = extrait.split("```")
+        extrait = max(morceaux, key=len)
+        if extrait.lstrip().startswith("json"):
+            extrait = extrait.lstrip()[4:]
+    debut = extrait.find("{")
+    fin = extrait.rfind("}")
+    if debut < 0 or fin <= debut:
+        return None
+    try:
+        data = json.loads(extrait[debut:fin + 1])
+    except ValueError:
         return None
     if not isinstance(data, dict) or "dat" not in data:
         return None
@@ -51,6 +72,12 @@ def analyze(data: dict):
 
     if dat.get("tm"):
         infos.append(f"État relevé le {dat['tm'][:10]} à {dat['tm'][11:19]} UTC")
+    # Deux identifiants distincts : le corps du robot et la tête RTK, qui
+    # est amovible et porte son propre firmware.
+    if dat.get("uuid"):
+        infos.append(f"Identifiant corps : {dat['uuid']}")
+    if (dat.get("head") or {}).get("uuid"):
+        infos.append(f"Identifiant tête RTK : {dat['head']['uuid']}")
     firmwares = [f"corps {dat['fw']}" for _ in (1,) if dat.get("fw")]
     if (dat.get("head") or {}).get("fw"):
         firmwares.append(f"tête {dat['head']['fw']}")
