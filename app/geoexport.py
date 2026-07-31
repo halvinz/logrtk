@@ -63,19 +63,99 @@ ZONE_KML_COLORS = ["ff4f9e1f", "ff3da3e8", "ffe87f3d", "ffb6599b",
                    "ffa3a316", "ff7a58d4"]
 
 
+def mask_to_polygons(mask, resolution, x0=0, y0=0, max_vertices=400) -> list:
+    """Contour d'un masque de carte, en mètres.
+
+    Le tracé des contours est confié à matplotlib, déjà utilisé pour la
+    carte : inutile d'écrire un suivi de frontière à la main.
+    """
+    try:
+        import numpy as np
+        from matplotlib.figure import Figure
+
+        arr = np.asarray(mask, dtype=float)
+        if arr.ndim != 2 or arr.max() <= 0:
+            return []
+        fig = Figure()
+        ax = fig.add_subplot(111)
+        cs = ax.contour(arr, levels=[0.5])
+        # get_paths() sur les versions récentes, allsegs sur les anciennes
+        try:
+            segments = [poly for path in cs.get_paths()
+                        for poly in path.to_polygons()]
+        except AttributeError:
+            segments = cs.allsegs[0]
+        fig.clf()
+    except Exception:
+        return []
+
+    polygons = []
+    for seg in segments:
+        if len(seg) < 8:
+            continue                      # bruit isolé
+        step = max(1, len(seg) // max_vertices)
+        pts = [((x0 + x) * resolution, (y0 + y) * resolution)
+               for x, y in seg[::step]]
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])            # un polygone KML doit être fermé
+        polygons.append(pts)
+    return polygons
+
+
+def _polygon(name: str, fill: str, line: str, coords: list) -> str:
+    ring = " ".join(f"{lon:.8f},{lat:.8f},0" for lat, lon in coords)
+    return f"""  <Placemark>
+    <name>{name}</name>
+    <Style>
+      <LineStyle><color>{line}</color><width>2</width></LineStyle>
+      <PolyStyle><color>{fill}</color></PolyStyle>
+    </Style>
+    <Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing>
+      <coordinates>{ring}</coordinates>
+    </LinearRing></outerBoundaryIs></Polygon>
+  </Placemark>
+"""
+
+
+def plm_placemarks(plm_map, georef: Georef) -> str:
+    """Contour du terrain et îlots issus de la carte .plm du robot."""
+    if plm_map is None or georef is None:
+        return ""
+    out = []
+    for layer in plm_map.layers:
+        if layer.kind == 2:
+            name, fill, line = "Terrain", "4d50b478", "ff2e7d32"
+        elif layer.kind == 3:
+            name, fill, line = f"Îlot {layer.id}", "b3404040", "ff202020"
+        else:
+            continue
+        arr = layer.to_array()
+        if arr is None:
+            continue
+        for poly in mask_to_polygons(arr, plm_map.resolution,
+                                     layer.x0, layer.y0):
+            out.append(_polygon(name, fill, line,
+                                [georef.to_latlon(x, y) for x, y in poly]))
+    return "".join(out)
+
+
 def build_kml(points, zones, station=None, georef: Georef = None,
-              title: str = "Tonte du robot", max_points: int = 6000) -> str:
+              title: str = "Tonte du robot", max_points: int = 6000,
+              plm_map=None) -> str:
     """Construit le KML : un tracé par zone de tonte, plus la station.
 
     `points` : liste de TrackPoint, `zones` : la zone de chacun.
     """
-    if georef is None or not points:
+    if georef is None or (not points and plm_map is None):
         return ""
+    points = points or []
+    zones = zones or []
 
     # Une trace d'un jour peut compter des dizaines de milliers de points :
     # on l'allège pour que Google Earth reste fluide.
     step = max(1, len(points) // max_points)
-    body = []
+    # le terrain d'abord : il sert de fond aux tracés posés par-dessus
+    body = [plm_placemarks(plm_map, georef)]
     by_zone = {}
     for p, z in zip(points[::step], zones[::step]):
         by_zone.setdefault(z, []).append(georef.to_latlon(p.x, p.y))

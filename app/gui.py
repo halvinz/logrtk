@@ -1357,9 +1357,12 @@ class MainWindow(QMainWindow):
         georef = self._georef()
         if georef is None:
             return
-        if not self.session.track:
-            QMessageBox.information(self, "Rien à exporter",
-                                    "Ces logs ne contiennent aucune position.")
+        if not self.session.track and self._plm_map is None:
+            QMessageBox.information(
+                self, "Rien à exporter",
+                "Ces logs ne contiennent aucune position. Joignez une carte "
+                ".plm pour exporter au moins le contour du terrain."
+            )
             return
         default = "-".join(filter(None, ("tonte", self.session.model)))
         path, _ = QFileDialog.getSaveFileName(
@@ -1373,7 +1376,8 @@ class MainWindow(QMainWindow):
         pts = [p for p in self.session.track if start <= p.ts <= end]
         zones = zones_of_points(pts, self._zone_timeline)
         kml = build_kml(pts, zones, station=self._station_xy, georef=georef,
-                        title=f"Tonte {self.session.model or 'robot'}")
+                        title=f"Tonte {self.session.model or 'robot'}",
+                        plm_map=self._plm_map)
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(kml)
