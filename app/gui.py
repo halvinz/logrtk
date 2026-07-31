@@ -1031,7 +1031,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Aucune donnée", "Aucun fichier de log reconnu n'a été trouvé.")
             return
 
-        self.lbl_loaded.setText(f"Chargé : {source_label}  —  fichiers : {', '.join(s.files_loaded)}")
+        # Seulement ce qui a été ouvert : le détail des journaux lus encombrait
+        # la barre. Il reste consultable en infobulle.
+        self.lbl_loaded.setText(f"Chargé : {source_label}")
+        self.lbl_loaded.setToolTip(
+            f"{len(s.files_loaded)} journaux lus :\n" + "\n".join(sorted(s.files_loaded))
+        )
 
         self.lbl_model.setText(s.model or "-")
         self.lbl_serial.setText(s.serial or "-")
