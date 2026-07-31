@@ -36,11 +36,15 @@ def _norm(texte: str) -> str:
 # --------------------------------------------------------------------------
 # Familles de robots, d'après la référence citée dans le message
 # --------------------------------------------------------------------------
+# Séries observées : 1xx filaires, 16x/17x/23x RTK première génération,
+# 24x et au-delà RTK deuxième génération.
 FAMILLES = [
     (r"kr\s?1[0-2]\d", "filaire"),
-    (r"kr\s?2[0-9]\d\s?e?s", "rtk2"),
     (r"kr\s?(16|17|23)\d", "rtk1"),
-    (r"\bfilaire\b|\bcable\b|\bfil\b", "filaire"),
+    (r"kr\s?2[4-9]\d", "rtk2"),
+    (r"\brtk\s?2\b|\bseconde generation\b", "rtk2"),
+    (r"\brtk\b", "rtk1"),
+    (r"\bfilaire\b|\bperimetrique\b", "filaire"),
 ]
 
 NOM_FAMILLE = {"filaire": "robot filaire", "rtk1": "robot RTK première génération",
@@ -64,9 +68,11 @@ def detecter_famille(texte: str):
 SYMPTOMES = [
     {
         "id": "e1",
+        "code": "E1",
+        "familles": ("filaire",),
         "motifs": ("e1", "fil manquant", "hors limite", "wire missing",
                    "sort de la zone", "depasse la limite"),
-        "label": "Erreur E1 — fil périmétrique perdu ou hors limites",
+        "label": "Fil périmétrique perdu ou robot hors limites",
         "categories": ("Navigation",),
         "causes": [
             ("Câble périmétrique coupé, abîmé ou mal connecté",
@@ -85,9 +91,11 @@ SYMPTOMES = [
     },
     {
         "id": "e2",
+        "code": "E2",
+        "familles": ("filaire",),
         "motifs": ("e2", "moteur de roue", "moteurs de roue", "roue bloquee",
                    "wheel blocked"),
-        "label": "Erreur E2 — moteur de roue bloqué",
+        "label": "Moteur de roue bloqué",
         "categories": ("Moteur de roue",),
         "causes": [
             ("Roues encrassées ou entravées",
@@ -99,6 +107,8 @@ SYMPTOMES = [
     },
     {
         "id": "rond",
+        "code": "",
+        "familles": (),
         "motifs": ("tourne en rond", "tournant en rond", "tourne sur lui",
                    "ne roule pas droit", "tourne en cercle", "en rond"),
         "label": "Le robot tourne en rond",
@@ -115,9 +125,11 @@ SYMPTOMES = [
     },
     {
         "id": "e3",
+        "code": "E3",
+        "familles": (),
         "motifs": ("e3", "lame", "moteur de coupe", "disque de coupe",
                    "blade"),
-        "label": "Erreur E3 — moteur de coupe",
+        "label": "Problème de moteur de coupe",
         "categories": ("Moteur de coupe", "Hauteur de coupe"),
         "causes": [
             ("Disque, lames ou arbre encombrés",
@@ -128,11 +140,13 @@ SYMPTOMES = [
     },
     {
         "id": "e4",
+        "code": "E4",
+        "familles": (),
         # « bloqué sur le code erreur » ne veut pas dire que le robot est
         # coincé physiquement : on exige un contexte de blocage réel.
         "motifs": ("e4", "piege", "coince", "trapped", "bloque dans",
                    "bloque contre", "bloque sous", "s enlise", "immobilise"),
-        "label": "Erreur E4 — robot piégé",
+        "label": "Robot piégé",
         "categories": ("Blocage / échappement",),
         "causes": [
             ("Terrain accidenté ou obstacle",
@@ -145,8 +159,10 @@ SYMPTOMES = [
     },
     {
         "id": "e5",
+        "code": "E5",
+        "familles": (),
         "motifs": ("e5", "souleve", "levage", "lifted"),
-        "label": "Erreur E5 — robot soulevé",
+        "label": "Robot soulevé",
         "categories": ("Sécurité", "Erreur M3"),
         "causes": [
             ("Roues avant entravées",
@@ -156,8 +172,10 @@ SYMPTOMES = [
     },
     {
         "id": "e6",
+        "code": "E6",
+        "familles": (),
         "motifs": ("e6", "a l envers", "renverse", "upside down", "pente"),
-        "label": "Erreur E6 — robot à l'envers",
+        "label": "Robot à l'envers",
         "categories": ("Sécurité",),
         "causes": [
             ("Pente supérieure à 35°", "Limite mécanique de la machine"),
@@ -167,10 +185,12 @@ SYMPTOMES = [
     },
     {
         "id": "charge",
+        "code": "E7",
+        "familles": (),
         "motifs": ("ne recharge pas", "ne charge pas", "ne se recharge pas",
                    "probleme de charge", "e7", "pas de charge",
                    "ne charge plus", "recharge pas"),
-        "label": "Erreur E7 — la recharge ne se fait pas",
+        "label": "La recharge ne se fait pas",
         "categories": ("Batterie",),
         "causes": [
             ("Broches de contact encrassées ou oxydées",
@@ -185,6 +205,8 @@ SYMPTOMES = [
     },
     {
         "id": "charge_allume",
+        "code": "",
+        "familles": (),
         "motifs": ("que s il est eteint", "s il est eteint", "eteint il charge",
                    "allume il ne charge pas", "quand il est eteint"),
         "label": "Charge uniquement robot éteint",
@@ -198,9 +220,11 @@ SYMPTOMES = [
     },
     {
         "id": "station",
+        "code": "E8",
+        "familles": (),
         "motifs": ("ne rentre pas", "ne retrouve pas sa station",
                    "ne trouve pas la station", "e8", "ne rentre plus"),
-        "label": "Erreur E8 — la station n'est pas retrouvée",
+        "label": "La station n'est pas retrouvée",
         "categories": ("Station de charge", "Bande magnétique"),
         "causes": [
             ("Station mal posée ou pas de niveau", "Vérifier l'assise et la fixation"),
@@ -210,8 +234,10 @@ SYMPTOMES = [
     },
     {
         "id": "pluie",
+        "code": "F1",
+        "familles": (),
         "motifs": ("pluie", "f1", "capteur de pluie"),
-        "label": "F1 — report de tonte pour pluie",
+        "label": "Report de tonte pour pluie",
         "categories": ("Capteur de pluie",),
         "causes": [
             ("Délai de pluie en cours", "180 min par défaut après séchage"),
@@ -220,7 +246,79 @@ SYMPTOMES = [
         ],
     },
     {
+        "id": "zone",
+        "code": "",
+        "familles": ("rtk1", "rtk2"),
+        "motifs": ("zone inaccessible", "ne va pas dans", "n atteint pas",
+                   "passage trop etroit", "ne passe pas", "chemin"),
+        "label": "Une zone n'est pas atteinte",
+        "categories": ("Navigation",),
+        "causes": [
+            ("Passage trop étroit ou absent",
+             "Au moins 1,2 m de large, 1,5 m recommandé, et 15 m au maximum"),
+            ("Chemin entre zones non créé",
+             "Créer un chemin zone à zone, ou vers la station"),
+            ("Signal insuffisant dans le passage",
+             "Pas plus de 1 à 2 m sans signal RTK"),
+        ],
+    },
+    {
+        "id": "carte",
+        "code": "",
+        "familles": ("rtk1", "rtk2"),
+        "motifs": ("erreur de carte", "carte ne se telecharge", "map error",
+                   "carte ne se charge", "probleme de carte",
+                   "recartographier", "cartographie"),
+        "label": "Problème de carte",
+        "categories": ("Carte", "Cartographie"),
+        "causes": [
+            ("RTK non attribué à la carte",
+             "Carte active, Détails, Station de recharge, Modifier, RTK"),
+            ("Mauvaise couverture pendant la cartographie",
+             "Refaire la carte en évitant les zones d'ombre"),
+            ("Liaison tête / robot",
+             "Vérifier la connexion physique et dans le portail"),
+        ],
+    },
+    {
+        "id": "batterie",
+        "code": "",
+        "familles": (),
+        "motifs": ("batterie", "ne tient pas la charge", "autonomie",
+                   "se decharge", "s eteint tout seul"),
+        "label": "Problème de batterie",
+        "categories": ("Batterie",),
+        "causes": [
+            ("Batterie en fin de vie",
+             "Tester au multimètre : plus de 15 V et plus de 0 A. "
+             "Sur RTK, remplacer si le SOH est sous 10 %"),
+            ("Contacts encrassés ou corrodés",
+             "Nettoyer les broches du robot et de la station"),
+            ("Température hors plage",
+             "Entre 0 et 40 °C sur RTK, 0 et 50 °C sur filaire"),
+        ],
+    },
+    {
+        "id": "irregulier",
+        "code": "",
+        "familles": (),
+        "motifs": ("tond mal", "coupe irreguliere", "manque des zones",
+                   "oublie des zones", "ne tond pas partout", "herbe haute",
+                   "coupe inegale"),
+        "label": "Tonte irrégulière ou zones oubliées",
+        "categories": ("Tonte", "Moteur de coupe"),
+        "causes": [
+            ("Fréquence de tonte insuffisante",
+             "Régler une fois par jour ou tous les deux jours"),
+            ("Lames émoussées", "Les remplacer"),
+            ("Cartographie perfectible",
+             "Zones interdites trop proches du bord, passages sous 1,5 m"),
+        ],
+    },
+    {
         "id": "position",
+        "code": "",
+        "familles": ("rtk1", "rtk2"),
         "motifs": ("pas de position", "perd le signal", "signal rtk",
                    "gps", "ne se localise pas", "rtk flottant"),
         "label": "Perte de position RTK",
@@ -277,8 +375,12 @@ def analyser(message: str, session=None, events=None) -> dict:
 
     releves = []
     for s in SYMPTOMES:
+        # « familles » vide = symptôme commun à toutes les gammes
+        limites = s.get("familles") or ()
+        if limites and famille and famille not in limites:
+            continue
         if any(m in bas for m in s["motifs"]):
-            releves.append(s)
+            releves.append(dict(s))
 
     # ce que les journaux disent de chaque symptôme
     par_categorie = {}
@@ -312,6 +414,10 @@ def rediger(rapport: dict) -> str:
     entete = " — ".join(x for x in (ref, famille) if x)
     if entete:
         out.append(f"<p><b>Machine :</b> {entete}</p>")
+    elif rapport["symptomes"]:
+        out.append("<p style='color:#b36b00'>Modèle non identifié : précisez "
+                   "la référence (KR101E, KR172E, KR260ES…) pour un "
+                   "diagnostic adapté à la gamme.</p>")
 
     if not rapport["symptomes"]:
         out.append("<p>Aucun symptôme connu n'a été reconnu dans ce message. "
@@ -326,7 +432,11 @@ def rediger(rapport: dict) -> str:
 
     out.append("<p><b>Symptômes relevés</b></p>")
     for s in rapport["symptomes"]:
-        out.append(f"<p style='margin-top:8px'><b>{s['label']}</b>")
+        # les codes E ne valent que pour les robots filaires : les afficher
+        # sur un RTK induirait le technicien en erreur
+        code = s.get("code") if rapport["famille"] == "filaire" else ""
+        titre = f"{code} — {s['label']}" if code else s["label"]
+        out.append(f"<p style='margin-top:8px'><b>{titre}</b>")
         if rapport["journaux_charges"]:
             n = s.get("_journaux", 0)
             if n:
