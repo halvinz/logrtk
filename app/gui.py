@@ -67,6 +67,8 @@ COL_WAY_STATION = "#111111"  # chemin vers la station : traits noirs
 COL_WAY_ZONE = "#7fdc9c"     # chemin vers une autre zone : vert clair
 COL_WAY_MAGNET = "#7e57c2"   # suivi de la bande magnétique : violet
 COL_FORBIDDEN = "#e53935"    # zones interdites (îlots)
+COL_ALERT_ERROR = "#c62828"  # repère d'erreur en mode analyse
+COL_ALERT_WARN = "#ef8c00"
 
 
 class TrackCanvas(FigureCanvas):
@@ -431,9 +433,14 @@ class TrackCanvas(FigureCanvas):
     # ------------------------------------------------------------------
     # Mode "Show time path"
     # ------------------------------------------------------------------
-    def enter_analysis(self, start: datetime):
+    def enter_analysis(self, start: datetime, alerts=None):
         """Passe la carte en mode analyse : zone estompée, le chemin du robot
-        se dessinera en bleu à partir de `start` (le zoom courant est gardé)."""
+        se dessinera en bleu à partir de `start` (le zoom courant est gardé).
+
+        `alerts` : liste de (date, gravité) marquées à l'endroit où le robot
+        se trouvait. À la vitesse de répétition du clavier, la bannière seule
+        défilerait trop vite : ces repères montrent où regarder.
+        """
         if not self._pts:
             return
         xlim, ylim = self.ax.get_xlim(), self.ax.get_ylim()
@@ -441,6 +448,7 @@ class TrackCanvas(FigureCanvas):
         self._analysis_start = start
         self._draw_zone(pale=True)
         self._draw_station()
+        self._draw_alerts(alerts)
         (self._trail,) = self.ax.plot([], [], color=COL_PATH, linewidth=2.5,
                                       solid_capstyle="round", zorder=5)
         self._make_robot_artists()
@@ -448,6 +456,24 @@ class TrackCanvas(FigureCanvas):
         self.ax.set_xlim(xlim)
         self.ax.set_ylim(ylim)
         self.draw()
+
+    def _draw_alerts(self, alerts):
+        """Place un repère à l'endroit où chaque incident s'est produit."""
+        if not alerts or not self._pts:
+            return
+        for severity, color, size in (("warn", COL_ALERT_WARN, 60),
+                                      ("error", COL_ALERT_ERROR, 90)):
+            xs, ys = [], []
+            for ts, sev in alerts:
+                if sev != severity:
+                    continue
+                i = bisect.bisect_left(self._ts, ts)
+                i = min(max(i, 0), len(self._pts) - 1)
+                xs.append(self._pts[i].x)
+                ys.append(self._pts[i].y)
+            if xs:
+                self.ax.scatter(xs, ys, marker="x", c=color, s=size,
+                                linewidths=2, zorder=6)
 
     def show_until(self, ts: datetime) -> TrackPoint | None:
         """Affiche la situation à l'instant `ts` : chemin depuis le départ de
@@ -483,6 +509,9 @@ class MainWindow(QMainWindow):
         self._magnetic_intervals: list = []           # suivi de la bande magnétique
         self._station_xy = None                       # position réelle de la station
         self._diag_events: list = []                  # diagnostic déjà calculé
+        self._alerts: list = []                       # (ts, diag) erreurs et alertes
+        self._alert_ts: list = []                     # leurs dates, pour bisect
+        self._alerts_seen: int = 0                    # rencontrées depuis le début
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -565,6 +594,15 @@ class MainWindow(QMainWindow):
         )
         analysis_bar.addWidget(self.lbl_time, stretch=1)
         left_layout.addLayout(analysis_bar)
+
+        # Bannière d'alerte : s'allume quand la lecture franchit une erreur.
+        # Elle n'interrompt jamais le défilement — maintenir Espace continue —
+        # et reste affichée jusqu'à l'incident suivant, sinon elle serait
+        # illisible à la vitesse de répétition du clavier.
+        self.lbl_alert = QLabel("")
+        self.lbl_alert.setWordWrap(True)
+        self.lbl_alert.setVisible(False)
+        left_layout.addWidget(self.lbl_alert)
 
         hint = QLabel(
             "1. Clic sur la carte : choisir un moment  •  2. « Show time path » puis "
@@ -727,25 +765,30 @@ class MainWindow(QMainWindow):
             start = self.analysis_start or self.canvas._pts[0].ts
             self.analysis_start = start
             self.analysis_time = start
-            self.canvas.enter_analysis(start)
+            self.canvas.enter_analysis(start, self._alert_marks())
             self.canvas.show_until(start)
             self.btn_timepath.setText("⏹  Show time path (actif)")
             self.lbl_time.setText(f"⏱  {start:%d/%m/%Y %H:%M:%S}")
             self.sync_logs_to_time(start)
+            self._alerts_seen = 0
+            self.lbl_alert.setVisible(False)
+            n = len([t for t in self._alert_ts if t >= start])
             self.statusBar().showMessage(
                 "Mode analyse : maintenez Espace pour avancer seconde par seconde, "
-                "Maj+Espace pour reculer, clic sur la carte pour repartir d'ailleurs."
+                f"Maj+Espace pour reculer. {n} incident(s) à venir seront signalés."
             )
             self.setFocus()
         else:
             self.btn_timepath.setText("▶  Show time path")
             self.lbl_time.setText("")
+            self.lbl_alert.setVisible(False)
             self.analysis_time = None
             self.refresh_track()
 
     def step_analysis(self, seconds: int):
         if self.analysis_time is None or not self.canvas._pts:
             return
+        previous = self.analysis_time
         t = self.analysis_time + timedelta(seconds=seconds)
         t_min = self.analysis_start
         t_max = self.canvas._pts[-1].ts
@@ -754,6 +797,8 @@ class MainWindow(QMainWindow):
         self.canvas.show_until(t)
         self.lbl_time.setText(f"⏱  {t:%d/%m/%Y %H:%M:%S}")
         self.sync_logs_to_time(t)
+        if t != previous:
+            self._show_alert(self._alerts_between(previous, t))
 
     def sync_logs_to_time(self, ts: datetime):
         """Cale la liste des logs sur la ligne la plus proche de `ts`."""
@@ -784,10 +829,12 @@ class MainWindow(QMainWindow):
         if self.btn_timepath.isChecked():
             # redémarre l'analyse à partir de ce moment
             self.analysis_time = point.ts
-            self.canvas.enter_analysis(point.ts)
+            self.canvas.enter_analysis(point.ts, self._alert_marks())
             self.canvas.show_until(point.ts)
             self.lbl_time.setText(f"⏱  {point.ts:%d/%m/%Y %H:%M:%S}")
             self.sync_logs_to_time(point.ts)
+            self._alerts_seen = 0
+            self.lbl_alert.setVisible(False)
             return
         self.canvas.select_time(point.ts)
         self.sync_logs_to_time(point.ts)
@@ -988,7 +1035,54 @@ class MainWindow(QMainWindow):
                 events.append([l.ts, l.ts, diag, 1, l.raw])
 
         self._diag_events = events
+        # incidents à signaler pendant la lecture « Show time path »
+        self._alerts = [(e[0], e[2]) for e in events
+                        if e[2]["severity"] in ("error", "warn")]
+        self._alert_ts = [a[0] for a in self._alerts]
         self.display_diagnostic()
+
+    # ------------------------------------------------------------------
+    # Alertes pendant la lecture
+    # ------------------------------------------------------------------
+    def _alert_marks(self) -> list:
+        """(date, gravité) des incidents, pour les repérer sur la carte."""
+        return [(ts, d["severity"]) for ts, d in self._alerts]
+
+    def _alerts_between(self, t0: datetime, t1: datetime) -> list:
+        """Incidents franchis en passant de `t0` à `t1`. L'intervalle est
+        semi-ouvert du côté déjà parcouru : sans cela, un incident tombant
+        pile sur une seconde serait signalé deux fois de suite."""
+        if t1 > t0:                       # avance : (t0, t1]
+            i = bisect.bisect_right(self._alert_ts, t0)
+            j = bisect.bisect_right(self._alert_ts, t1)
+        else:                             # recul : [t1, t0)
+            i = bisect.bisect_left(self._alert_ts, t1)
+            j = bisect.bisect_left(self._alert_ts, t0)
+        return self._alerts[i:j]
+
+    def _show_alert(self, hits: list):
+        """Affiche l'incident le plus grave parmi ceux qui viennent d'être
+        franchis. Purement visuel : aucune boîte de dialogue, sinon le
+        défilement à touche maintenue serait interrompu à chaque erreur."""
+        if not hits:
+            return
+        self._alerts_seen += len(hits)
+        ts, d = min(hits, key=lambda h: 0 if h[1]["severity"] == "error" else 1)
+        error = d["severity"] == "error"
+        icon = "⛔" if error else "⚠"
+        text = f"{icon}  {ts:%d/%m %H:%M:%S}   [{d['category']}]  {d['meaning']}"
+        if d["conclusion"]:
+            text += f"\n     → {d['conclusion']}"
+        if len(hits) > 1:
+            text += f"     (+{len(hits) - 1} autre(s) au même moment)"
+        text += f"\n     {self._alerts_seen} incident(s) depuis le début de la lecture"
+        self.lbl_alert.setText(text)
+        self.lbl_alert.setStyleSheet(
+            "background: %s; color: white; font-size: 12px; font-weight: bold;"
+            " padding: 6px; border-radius: 4px;"
+            % ("#c62828" if error else "#ef8c00")
+        )
+        self.lbl_alert.setVisible(True)
 
     def _summarize(self, events):
         """Rassemble toutes les occurrences d'un même problème en une ligne.
@@ -1097,9 +1191,11 @@ class MainWindow(QMainWindow):
         self.analysis_start = ts
         if self.btn_timepath.isChecked():
             self.analysis_time = ts
-            self.canvas.enter_analysis(ts)
+            self.canvas.enter_analysis(ts, self._alert_marks())
             self.canvas.show_until(ts)
             self.lbl_time.setText(f"⏱  {ts:%d/%m/%Y %H:%M:%S}")
+            self._alerts_seen = 0
+            self.lbl_alert.setVisible(False)
         else:
             self.canvas.select_time(ts)
         self.sync_logs_to_time(ts)
