@@ -201,6 +201,44 @@ def station_position(points, lines):
     return xs[len(xs) // 2], ys[len(ys) // 2]
 
 
+_RE_ZONE = re.compile(
+    r"CURRENT_REGION_ID:\s*\[(\d+)\]|region[ _]id\s*=\s*(\d+)", re.I)
+
+
+def zone_timeline(lines) -> list:
+    """[(date, numéro de zone)] au fil du temps.
+
+    Les robots multi-zones indiquent la zone en cours de tonte ; la zone 0
+    correspond aux moments où le robot n'est dans aucune zone, c'est-à-dire
+    quand il emprunte le couloir de liaison entre deux zones.
+    """
+    out = []
+    for l in lines:
+        if l.ts is None or l.ts.year < MIN_VALID_YEAR:
+            continue
+        m = _RE_ZONE.search(l.raw)
+        if not m:
+            continue
+        zone = int(m.group(1) or m.group(2))
+        if not out or out[-1][1] != zone:
+            out.append((l.ts, zone))
+    out.sort(key=lambda e: e[0])
+    return out
+
+
+def zones_of_points(points, timeline) -> list:
+    """Zone de chaque position, d'après la dernière zone annoncée avant elle."""
+    if not timeline:
+        return [1] * len(points)
+    times = [t for t, _ in timeline]
+    zones = [z for _, z in timeline]
+    out = []
+    for p in points:
+        i = bisect.bisect_right(times, p.ts) - 1
+        out.append(zones[i] if i >= 0 else 0)
+    return out
+
+
 def station_approach(points, lines, station, max_dist=8.0):
     """Cap de l'axe d'accostage quand les logs ne le donnent pas (RTK1) :
     on relève par où le robot arrive dans les secondes qui précèdent la mise

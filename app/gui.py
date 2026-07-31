@@ -45,7 +45,8 @@ from logbible import (analyze_line, analyze_rtk2_line, normalize,
                       robot_categories, search_terms, SEARCH_CATALOG)
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
-                      station_approach, build_grid, rasterize)
+                      station_approach, build_grid, rasterize,
+                      zone_timeline, zones_of_points)
 
 # Fenêtre de regroupement des événements identiques dans l'onglet Diagnostic
 GROUP_SECONDS = 120
@@ -59,6 +60,10 @@ COL_ZONE = "#1f9e4f"       # tondu sur la période affichée : vert franc
 COL_LAWN = "#bfe6ce"       # pelouse entière (tout l'historique) : vert pâle
 COL_ZONE_PALE = "#d7efe0"  # les deux estompés en mode analyse
 COL_LAWN_PALE = "#ecf6f0"
+
+# Une couleur par zone de tonte, comme dans l'application du robot.
+ZONE_COLORS = ["#1f9e4f", "#e8a33d", "#3d7fe8", "#9b59b6", "#16a3a3", "#d4587a"]
+COL_TRANSIT = "#f2f2f2"    # couloir de liaison entre deux zones (zone 0)
 COL_PATH = "#1565c0"       # chemin parcouru en mode analyse
 COL_ROBOT = "#111111"      # position du robot
 COL_STATION = "#ffd400"    # station de charge (jaune)
@@ -67,7 +72,7 @@ COL_SELECT = "#d81b60"     # anneau de sélection
 COL_WAY_STATION = "#111111"  # chemin vers la station : traits noirs
 COL_WAY_ZONE = "#7fdc9c"     # chemin vers une autre zone : vert clair
 COL_WAY_MAGNET = "#7e57c2"   # suivi de la bande magnétique : violet
-COL_FORBIDDEN = "#e53935"    # zones interdites (îlots)
+COL_UNMOWED = "#dcdcdc"      # poches non tondues à l'intérieur du terrain
 COL_ALERT_ERROR = "#c62828"  # repère d'erreur en mode analyse
 COL_ALERT_WARN = "#ef8c00"
 
@@ -97,10 +102,11 @@ class TrackCanvas(FigureCanvas):
         self._trail = None
         self._robot_marker = None
         self._robot_arrow = None
-        self._forbidden = None
+        self._unmowed = None
         self._grid = None
         self._lawn_mask = None
         self._mowed_mask = None
+        self._zone_masks: dict = {}
         self._view_pts: list[TrackPoint] = []
         self._station = None
         self._station_heading = None
@@ -255,9 +261,15 @@ class TrackCanvas(FigureCanvas):
             interpolation="nearest", zorder=zorder,
         )
 
+    def _zone_color(self, zone: int) -> str:
+        if zone == 0:
+            return COL_TRANSIT
+        return ZONE_COLORS[(zone - 1) % len(ZONE_COLORS)]
+
     def _draw_zone(self, pale: bool):
-        """Pelouse entière en vert pâle, tonte de la période affichée en vert
-        franc par-dessus, zones interdites en rouge, puis les chemins."""
+        """Pelouse entière en pâle, puis la tonte de la période affichée :
+        une couleur par zone comme dans l'application du robot, et le couloir
+        de liaison entre zones en clair."""
         if self._grid is None:
             # trace trop courte pour un quadrillage : on retombe sur des points
             self.ax.scatter([p.x for p in self._pts], [p.y for p in self._pts],
@@ -266,10 +278,12 @@ class TrackCanvas(FigureCanvas):
             return
         self._fill(self._lawn_mask, COL_LAWN_PALE if pale else COL_LAWN,
                    1.0, zorder=1)
-        self._fill(self._mowed_mask, COL_ZONE_PALE if pale else COL_ZONE,
-                   1.0, zorder=2)
-        self._fill(self._forbidden, COL_FORBIDDEN, 0.35 if pale else 0.8,
-                   zorder=3)
+        for zone in sorted(self._zone_masks):
+            color = COL_ZONE_PALE if pale else self._zone_color(zone)
+            # le couloir passe au-dessus : c'est lui qui relie les zones
+            self._fill(self._zone_masks[zone], color, 1.0,
+                       zorder=3 if zone == 0 else 2)
+        self._fill(self._unmowed, COL_UNMOWED, 0.5 if pale else 1.0, zorder=4)
 
         a = 0.4 if pale else 1.0
         if self._show.get("zone", True):
@@ -332,12 +346,26 @@ class TrackCanvas(FigureCanvas):
                          fontsize=9, zorder=10)
 
     def _legend(self, analysis: bool):
-        handles = [
-            Line2D([], [], marker="s", linestyle="", color=COL_ZONE,
-                   label="Tondu sur la période affichée"),
-            Line2D([], [], marker="s", linestyle="", color=COL_LAWN,
-                   label="Pelouse (tout l'historique)"),
-        ]
+        handles = []
+        zones = [z for z in sorted(self._zone_masks) if z != 0]
+        if len(zones) > 1:
+            for z in zones:
+                handles.append(Line2D([], [], marker="s", linestyle="",
+                                      color=self._zone_color(z),
+                                      label=f"Zone {z}"))
+            if 0 in self._zone_masks:
+                handles.append(Line2D([], [], marker="s", linestyle="",
+                                      color=COL_TRANSIT,
+                                      label="Liaison entre zones"))
+        else:
+            handles.append(Line2D([], [], marker="s", linestyle="",
+                                  color=COL_ZONE,
+                                  label="Tondu sur la période affichée"))
+        handles.append(Line2D([], [], marker="s", linestyle="", color=COL_LAWN,
+                              label="Pelouse (tout l'historique)"))
+        if self._unmowed is not None:
+            handles.append(Line2D([], [], marker="s", linestyle="",
+                                  color=COL_UNMOWED, label="Non tondu"))
         if self._show.get("station", True) and self._runs(1):
             handles.append(Line2D([], [], color=COL_WAY_STATION,
                                   linestyle=(0, (5, 3)), linewidth=1.8,
@@ -348,10 +376,6 @@ class TrackCanvas(FigureCanvas):
         if self._show.get("zone", True) and self._runs(2):
             handles.append(Line2D([], [], color=COL_WAY_ZONE, linewidth=2.6,
                                   label="Chemin vers une autre zone"))
-        if self._forbidden is not None:
-            handles.append(Line2D([], [], marker="s", linestyle="",
-                                  color=COL_FORBIDDEN, alpha=0.75,
-                                  label="Zone interdite / obstacle"))
         if self._station is not None:
             handles.append(Line2D([], [], marker="o", linestyle="",
                                   markerfacecolor=COL_STATION,
@@ -381,7 +405,7 @@ class TrackCanvas(FigureCanvas):
                    station_intervals=None, zone_intervals=None,
                    magnetic_intervals=None, station_xy=None,
                    station_heading=None, show_forbidden: bool = True,
-                   show=None, all_points=None):
+                   show=None, all_points=None, zone_timeline=None):
         """`points` : la période affichée (vert franc).
         `all_points` : tout l'historique, qui définit l'étendue de la pelouse
         (vert pâle) — c'est ce contraste qui montre ce qui a été tondu."""
@@ -395,23 +419,32 @@ class TrackCanvas(FigureCanvas):
                                    filter_outliers)
         self._grid = build_grid([p.x for p in base], [p.y for p in base])
         self._lawn_mask = None
-        self._forbidden = None
+        self._unmowed = None
         if self._grid is not None:
             self._lawn_mask = rasterize([p.x for p in base],
                                         [p.y for p in base], self._grid)
             if show_forbidden:
-                self._forbidden = forbidden_zones(self._lawn_mask, self._grid)
+                self._unmowed = forbidden_zones(self._lawn_mask, self._grid)
 
         self._pts = self._filter_points(points, filter_outliers)
         self._ts = [p.ts for p in self._pts]
         self._cats = classify_points(self._pts, station_intervals or [],
                                      zone_intervals or [],
                                      magnetic=magnetic_intervals or [])
-        mowed = [p for p, c in zip(self._pts, self._cats) if c == 0]
-        self._mowed_mask = (
-            rasterize([p.x for p in mowed], [p.y for p in mowed], self._grid)
-            if self._grid is not None else None
-        )
+        # Un masque par zone de tonte : c'est ce qui donne les couleurs
+        # distinctes de l'application officielle.
+        zones = zones_of_points(self._pts, zone_timeline or [])
+        self._zone_masks = {}
+        self._mowed_mask = None
+        if self._grid is not None:
+            mowed = [(p, z) for p, c, z in zip(self._pts, self._cats, zones)
+                     if c == 0]
+            for zone in sorted({z for _, z in mowed}):
+                pts = [p for p, z in mowed if z == zone]
+                self._zone_masks[zone] = rasterize(
+                    [p.x for p in pts], [p.y for p in pts], self._grid)
+            self._mowed_mask = rasterize([p.x for p, _ in mowed],
+                                         [p.y for p, _ in mowed], self._grid)
         # la vue doit englober toute la pelouse, pas seulement le jour affiché
         self._view_pts = base or self._pts
         if not self._pts:
@@ -526,6 +559,7 @@ class MainWindow(QMainWindow):
         self._station_intervals: list = []            # trajets vers/depuis la station
         self._zone_intervals: list = []               # transferts vers une autre zone
         self._magnetic_intervals: list = []           # suivi de la bande magnétique
+        self._zone_timeline: list = []                # zone de tonte au fil du temps
         self._station_xy = None                       # position réelle de la station
         self._diag_events: list = []                  # diagnostic déjà calculé
         self._alerts: list = []                       # (ts, diag) erreurs et alertes
@@ -581,7 +615,11 @@ class MainWindow(QMainWindow):
         # --- Couches affichées sur la carte ---
         layer_bar = QHBoxLayout()
         layer_bar.addWidget(QLabel("Afficher :"))
-        self.chk_forbidden = QCheckBox("Zones interdites")
+        self.chk_forbidden = QCheckBox("Non tondu")
+        self.chk_forbidden.setToolTip(
+            "Poches jamais parcourues à l'intérieur du terrain : obstacle "
+            "(massif, arbre) ou simplement zone pas encore tondue."
+        )
         self.chk_way_station = QCheckBox("Chemin station")
         self.chk_way_magnet = QCheckBox("Bande magnétique")
         self.chk_way_zone = QCheckBox("Chemin entre zones")
@@ -1026,6 +1064,7 @@ class MainWindow(QMainWindow):
 
         self._station_intervals, self._zone_intervals = path_intervals(s.lines)
         self._magnetic_intervals = magnetic_intervals(s.lines)
+        self._zone_timeline = zone_timeline(s.lines)
         # en RTK2 la station et son axe sont donnés par les logs ; en RTK1 on
         # les déduit des passages en charge
         self._station_xy = s.station_xy or station_position(s.track, s.lines)
@@ -1323,6 +1362,7 @@ class MainWindow(QMainWindow):
             station_xy=self._station_xy,
             station_heading=self._station_heading,
             show_forbidden=self.chk_forbidden.isChecked(),
+            zone_timeline=self._zone_timeline,
             show={
                 "station": self.chk_way_station.isChecked(),
                 "magnet": self.chk_way_magnet.isChecked(),
