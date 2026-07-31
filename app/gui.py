@@ -874,10 +874,16 @@ class MainWindow(QMainWindow):
             fw = QApplication.focusWidget()
             if isinstance(fw, (QLineEdit, QTextEdit, QDateTimeEdit)):
                 return super().eventFilter(obj, event)
-            step = -1 if event.modifiers() & Qt.ShiftModifier else 1
             if self.btn_timepath.isChecked():
+                # la vitesse choisie s'applique aussi au pas à pas : aucun
+                # incident n'est manqué pour autant, la bannière examine tout
+                # l'intervalle franchi et le tracé se dessine en entier
+                step = self._speed()
+                if event.modifiers() & Qt.ShiftModifier:
+                    step = -step
                 self.step_analysis(step)
                 return True
+            step = -1 if event.modifiers() & Qt.ShiftModifier else 1
             if fw is self.list_logs:
                 row = self.list_logs.currentRow() + step
                 row = max(0, min(row, self.list_logs.count() - 1))
