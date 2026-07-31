@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QLineEdit, QComboBox, QListWidget,
     QListWidgetItem, QSplitter, QGroupBox, QFormLayout, QDateTimeEdit,
     QCheckBox, QStatusBar, QMessageBox, QTabWidget, QTextEdit,
-    QAbstractItemView
+    QAbstractItemView, QInputDialog
 )
 from PySide6.QtGui import QColor
 
@@ -635,6 +635,7 @@ class MainWindow(QMainWindow):
         self._magnetic_intervals: list = []           # suivi de la bande magnétique
         self._zone_timeline: list = []                # zone de tonte au fil du temps
         self._plm_map = None                          # carte .plm jointe
+        self._manual_anchor = None                    # repère GPS saisi à la main
         self._station_xy = None                       # position réelle de la station
         self._diag_events: list = []                  # diagnostic déjà calculé
         self._alerts: list = []                       # (ts, diag) erreurs et alertes
@@ -763,7 +764,8 @@ class MainWindow(QMainWindow):
         self.btn_play.toggled.connect(self.on_play_toggled)
         analysis_bar.addWidget(self.btn_play)
         self.combo_speed = QComboBox()
-        for label, mult in (("×1", 1), ("×2", 2), ("×5", 5), ("×10", 10)):
+        for label, mult in (("×1", 1), ("×2", 2), ("×5", 5), ("×10", 10),
+                            ("×30", 30), ("×50", 50), ("×100", 100)):
             self.combo_speed.addItem(label, mult)
         self.combo_speed.setToolTip("Vitesse de lecture (secondes de log par seconde réelle)")
         self.combo_speed.currentIndexChanged.connect(self.on_speed_changed)
@@ -772,6 +774,11 @@ class MainWindow(QMainWindow):
         self.lbl_time.setStyleSheet(
             "font-size: 17px; font-weight: bold; color: #1565c0; padding-left: 10px;"
         )
+        self.lbl_time.setCursor(Qt.PointingHandCursor)
+        self.lbl_time.setToolTip(
+            "Cliquez pour retrouver ce moment dans l'historique et le diagnostic"
+        )
+        self.lbl_time.installEventFilter(self)
         analysis_bar.addWidget(self.lbl_time, stretch=1)
         left_layout.addLayout(analysis_bar)
 
@@ -919,6 +926,10 @@ class MainWindow(QMainWindow):
     # Hors mode analyse, Espace fait défiler la liste des logs.
     # ------------------------------------------------------------------
     def eventFilter(self, obj, event):
+        if obj is self.lbl_time and event.type() == QEvent.MouseButtonRelease \
+                and self.analysis_time is not None:
+            self.reveal_moment(self.analysis_time)
+            return True
         if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space:
             fw = QApplication.focusWidget()
             if isinstance(fw, (QLineEdit, QTextEdit, QDateTimeEdit)):
@@ -1025,24 +1036,47 @@ class MainWindow(QMainWindow):
         if t != previous:
             self._show_alert(self._alerts_between(previous, t))
 
-    def sync_logs_to_time(self, ts: datetime):
-        """Cale la liste des logs sur la ligne la plus proche de `ts`."""
+    def _closest_row(self, widget, ts: datetime) -> int:
+        """Ligne dont l'horodatage est le plus proche de `ts`, ou -1."""
         best_row, best_gap = -1, None
-        for i in range(self.list_logs.count()):
-            lts = self.list_logs.item(i).data(Qt.UserRole)
+        for i in range(widget.count()):
+            lts = widget.item(i).data(Qt.UserRole)
             if lts is None:
                 continue
             gap = abs((lts - ts).total_seconds())
             if best_gap is None or gap < best_gap:
                 best_row, best_gap = i, gap
-        if best_row < 0:
+        return best_row
+
+    def _select_row(self, widget, row: int):
+        """Sélectionne sans réveiller les signaux : pendant la lecture, cela
+        relancerait l'analyse à chaque seconde."""
+        if row < 0:
             return
-        self.list_logs.blockSignals(True)
-        self.list_logs.setCurrentRow(best_row)
-        self.list_logs.blockSignals(False)
-        self.list_logs.scrollToItem(
-            self.list_logs.item(best_row),
-            QAbstractItemView.ScrollHint.PositionAtCenter,
+        widget.blockSignals(True)
+        widget.setCurrentRow(row)
+        widget.blockSignals(False)
+        widget.scrollToItem(widget.item(row),
+                            QAbstractItemView.ScrollHint.PositionAtCenter)
+
+    def sync_logs_to_time(self, ts: datetime):
+        """Cale l'historique et le diagnostic sur le moment `ts`."""
+        self._select_row(self.list_logs, self._closest_row(self.list_logs, ts))
+        self._select_row(self.list_diag, self._closest_row(self.list_diag, ts))
+
+    def reveal_moment(self, ts: datetime):
+        """Clic sur l'heure : montre la ligne correspondante dans les deux
+        onglets et bascule sur l'historique."""
+        self.sync_logs_to_time(ts)
+        row = self._closest_row(self.list_logs, ts)
+        if row < 0:
+            self.statusBar().showMessage(
+                "Aucune ligne de log pour ce moment — élargissez les filtres.")
+            return
+        self.tabs.setCurrentWidget(self.logs_widget)
+        self.statusBar().showMessage(
+            f"Moment {ts:%d/%m/%Y %H:%M:%S} retrouvé dans l'historique "
+            "et le diagnostic."
         )
 
     # ------------------------------------------------------------------
@@ -1341,17 +1375,44 @@ class MainWindow(QMainWindow):
     # Superposition sur une vue aérienne
     # ------------------------------------------------------------------
     def _georef(self):
-        """Repère GPS de la carte, ou None avec un message d'explication."""
+        """Repère GPS de la carte. Les logs RTK2 le contiennent ; les RTK1
+        non — on le demande alors à l'utilisateur, qui peut le relever sur
+        le portail du robot ou sur Google Maps."""
         anchor = self.session.geo_anchor if self.session else None
-        if not anchor:
-            QMessageBox.information(
-                self, "Pas d'ancrage GPS",
-                "Ces logs ne contiennent pas le point d'ancrage GPS de la "
-                "carte (map/pose_graph/anchor_rtk_info.txt).\n\n"
-                "Impossible de situer le terrain sur une vue aérienne."
+        if anchor:
+            return Georef(anchor[0], anchor[1], anchor[2])
+        if self._manual_anchor:
+            return Georef(*self._manual_anchor)
+
+        text, ok = QInputDialog.getText(
+            self, "Situer le terrain",
+            "Ces logs ne contiennent pas de coordonnées GPS (c'est le cas des\n"
+            "robots RTK1). Indiquez la position du point d'origine de la carte,\n"
+            "relevée sur le portail du robot ou sur Google Maps.\n\n"
+            "Format : latitude, longitude [, rotation en degrés]\n"
+            "Exemple : 47.287676, 0.162261, 3.2",
+            text=", ".join(str(v) for v in (self._manual_anchor or ()))
+        )
+        if not ok or not text.strip():
+            return None
+        parts = [p.strip().replace(",", ".") for p in text.replace(";", ",").split(",")]
+        try:
+            values = [float(p) for p in parts if p]
+            lat, lon = values[0], values[1]
+            rot = values[2] if len(values) > 2 else 0.0
+        except (ValueError, IndexError):
+            QMessageBox.warning(self, "Coordonnées illisibles",
+                                "Attendu : latitude, longitude [, rotation].")
+            return None
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            QMessageBox.warning(
+                self, "Coordonnées hors limites",
+                "La latitude doit être comprise entre -90 et 90, la longitude "
+                "entre -180 et 180. Les avez-vous inversées ?"
             )
             return None
-        return Georef(anchor[0], anchor[1], anchor[2])
+        self._manual_anchor = (lat, lon, rot)
+        return Georef(lat, lon, rot)
 
     def on_export_kml(self):
         georef = self._georef()
