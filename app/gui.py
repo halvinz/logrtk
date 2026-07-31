@@ -46,6 +46,7 @@ from logbible import (analyze_line, analyze_rtk2_line, normalize,
                       robot_categories, search_terms, SEARCH_CATALOG)
 from geoexport import Georef, build_kml, maps_url
 from plm import read_plm, KIND_AREA as PLM_AREA, KIND_ISLAND as PLM_ISLAND
+from portal import read_status
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
                       station_approach, build_grid, rasterize,
@@ -637,6 +638,7 @@ class MainWindow(QMainWindow):
         self._zone_timeline: list = []                # zone de tonte au fil du temps
         self._plm_map = None                          # carte .plm jointe
         self._manual_anchor = None                    # repère GPS saisi à la main
+        self._portal = None                           # état MQTT du portail
         self._station_xy = None                       # position réelle de la station
         self._diag_events: list = []                  # diagnostic déjà calculé
         self._alerts: list = []                       # (ts, diag) erreurs et alertes
@@ -662,12 +664,19 @@ class MainWindow(QMainWindow):
             "et îlots (massifs, arbres, bassins)."
         )
         self.btn_open_plm.clicked.connect(self.on_open_plm)
+        self.btn_open_portal = QPushButton("Joindre un état portail…")
+        self.btn_open_portal.setToolTip(
+            "Message d'état MQTT du portail (.json) : batterie, signal,\n"
+            "firmware et réglages, absents des journaux du robot."
+        )
+        self.btn_open_portal.clicked.connect(self.on_open_portal)
         self.btn_open_files = QPushButton("Ouvrir des fichiers…")
         self.btn_open_files.clicked.connect(self.on_open_files)
         self.lbl_loaded = QLabel("Aucun fichier chargé.")
         top_bar.addWidget(self.btn_open_folder)
         top_bar.addWidget(self.btn_open_zip)
         top_bar.addWidget(self.btn_open_plm)
+        top_bar.addWidget(self.btn_open_portal)
         top_bar.addWidget(self.btn_open_files)
         top_bar.addWidget(self.lbl_loaded, stretch=1)
         root.addLayout(top_bar)
@@ -1180,6 +1189,33 @@ class MainWindow(QMainWindow):
             f"{os.path.basename(path)}\n\n{carte.summary()}{note}"
         )
 
+    def on_open_portal(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choisir un état du portail", "", "État MQTT (*.json)"
+        )
+        if not path:
+            return
+        resultat = read_status(path)
+        if resultat is None:
+            QMessageBox.warning(
+                self, "Format non reconnu",
+                "Ce fichier n'est pas un message d'état du portail.\n\n"
+                "Attendu : le JSON contenant les blocs « cfg » et « dat »."
+            )
+            return
+        self._portal = resultat
+        infos, constats = resultat
+        if self.session:
+            self.refresh_diagnostic()
+        problemes = [c for c in constats if c["severity"] != "info"]
+        QMessageBox.information(
+            self, "État du portail chargé",
+            "\n".join(infos) + (
+                f"\n\n{len(problemes)} point(s) à vérifier — voir l'onglet "
+                "Diagnostic." if problemes else "\n\nAucune anomalie relevée."
+            )
+        )
+
     def on_open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Choisir un ou plusieurs fichiers de logs", "",
@@ -1368,6 +1404,8 @@ class MainWindow(QMainWindow):
             else:
                 events.append([l.ts, l.ts, diag, 1, l.raw])
 
+        # L'état du portail décrit la situation actuelle : il ouvre la liste
+        events = self._portal_events() + events
         self._diag_events = events
         self.refresh_summary(events)
         # incidents à signaler pendant la lecture « Show time path »
@@ -1514,6 +1552,15 @@ class MainWindow(QMainWindow):
         )
         self.lbl_alert.setVisible(True)
 
+    def _portal_events(self) -> list:
+        """Constats de l'état du portail, présentés comme des incidents pour
+        apparaître dans la même liste que ceux tirés des journaux."""
+        if not self._portal:
+            return []
+        _infos, constats = self._portal
+        ts = self.dt_end.dateTime().toPython()
+        return [[ts, ts, c, 1, c["meaning"]] for c in constats]
+
     def refresh_summary(self, events):
         """Remplit l'encadré de synthèse en tête du diagnostic."""
         if not self.session:
@@ -1527,6 +1574,8 @@ class MainWindow(QMainWindow):
         couleur = {"error": "#c62828", "warn": "#b36b00"}.get(gravite, "#2e7d32")
         titre = {"error": "⛔ Conclusion", "warn": "⚠ Conclusion"}.get(
             gravite, "✔ Conclusion")
+        if self._portal:
+            lignes = list(self._portal[0]) + lignes
         corps = "<br>".join(f"• {l}" for l in lignes)
         self.txt_summary.setHtml(
             f"<div style='font-size:12px'>{corps}"
