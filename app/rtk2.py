@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 import glob
+import math
 from datetime import datetime
 
 
@@ -150,27 +151,39 @@ def parse_file(path: str, session) -> None:
 
 
 def read_station(folder: str):
-    """Position de la station de charge, lue dans le graphe de poses SLAM
-    (base_position). Contrairement au format RTK1, elle est donnée telle
-    quelle : inutile de la deviner à partir des passages en charge."""
+    """Position de la station de charge et axe d'accostage, lus dans le
+    graphe de poses SLAM (base_position). Contrairement au format RTK1, tout
+    est donné tel quel : inutile de le deviner à partir des passages en charge.
+
+    Renvoie ((x, y), cap_d_approche_en_degres) — le cap pointe vers l'avant
+    de la station, là d'où le robot arrive.
+    """
     path = os.path.join(folder, "map", "pose_graph", "trajectory_state.yaml")
     if not os.path.isfile(path):
-        return None
+        return None, None
     try:
         with open(path, "r", errors="ignore") as f:
             text = f.read()
     except OSError:
-        return None
+        return None, None
     m = re.search(
-        r"base_position:\s*\n\s*position:\s*\n\s*x:\s*(-?[\d.eE+]+)\s*\n\s*y:\s*(-?[\d.eE+]+)",
+        r"base_position:\s*\n\s*position:\s*\n"
+        r"\s*x:\s*(-?[\d.eE+]+)\s*\n\s*y:\s*(-?[\d.eE+]+)[\s\S]{0,200}?"
+        r"rotation:\s*\n\s*w:\s*(-?[\d.eE+]+)[\s\S]{0,120}?z:\s*(-?[\d.eE+]+)",
         text,
     )
     if not m:
-        return None
+        return None, None
     try:
-        return float(m.group(1)), float(m.group(2))
+        x, y = float(m.group(1)), float(m.group(2))
+        w, z = float(m.group(3)), float(m.group(4))
     except ValueError:
-        return None
+        return None, None
+    # Le quaternion donne le cap de la station ; le robot arrive par devant,
+    # soit à 180° de ce cap (vérifié sur les logs : à 0,8 m de la base, le
+    # relevé mesuré tombe à 0,3° de cette valeur).
+    yaw = math.degrees(2 * math.atan2(z, w))
+    return (x, y), (yaw % 360.0) - 180.0     # demi-tour, puis ramené dans [-180, 180[
 
 
 def read_identity(folder: str, session) -> None:
@@ -199,5 +212,5 @@ def load(folder: str, session) -> None:
     root = os.path.dirname(log_dir) if os.path.basename(log_dir) == "log" else folder
     for path in _event_files(log_dir):
         parse_file(path, session)
-    session.station_xy = read_station(root)
+    session.station_xy, session.station_heading = read_station(root)
     read_identity(root, session)

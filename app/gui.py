@@ -19,10 +19,11 @@ from __future__ import annotations
 import os
 import re
 import sys
+import math
 import bisect
 from datetime import datetime, time, timedelta
 
-from PySide6.QtCore import Qt, QEvent
+from PySide6.QtCore import Qt, QEvent, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QLineEdit, QComboBox, QListWidget,
@@ -44,7 +45,7 @@ from logbible import (analyze_line, analyze_rtk2_line, normalize,
                       robot_categories, search_terms, SEARCH_CATALOG)
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
-                      build_grid, rasterize)
+                      station_approach, build_grid, rasterize)
 
 # Fenêtre de regroupement des événements identiques dans l'onglet Diagnostic
 GROUP_SECONDS = 120
@@ -69,6 +70,9 @@ COL_WAY_MAGNET = "#7e57c2"   # suivi de la bande magnétique : violet
 COL_FORBIDDEN = "#e53935"    # zones interdites (îlots)
 COL_ALERT_ERROR = "#c62828"  # repère d'erreur en mode analyse
 COL_ALERT_WARN = "#ef8c00"
+
+# Longueur du couloir d'accostage tracé devant la station
+DOCK_LINE_METERS = 3.0
 
 
 class TrackCanvas(FigureCanvas):
@@ -99,6 +103,7 @@ class TrackCanvas(FigureCanvas):
         self._mowed_mask = None
         self._view_pts: list[TrackPoint] = []
         self._station = None
+        self._station_heading = None
         self._show: dict = {}
         self._analysis_start: datetime | None = None
         self.on_point_clicked = None  # callback(TrackPoint), posé par MainWindow
@@ -312,6 +317,14 @@ class TrackCanvas(FigureCanvas):
         if self._station is None:
             return
         x, y = self._station
+        # Axe d'accostage : le robot rentre en ligne droite face à la station.
+        if self._station_heading is not None:
+            rad = math.radians(self._station_heading)
+            length = DOCK_LINE_METERS
+            self.ax.plot([x, x + length * math.cos(rad)],
+                         [y, y + length * math.sin(rad)],
+                         color=COL_STATION_EDGE, linewidth=2.0,
+                         linestyle=(0, (6, 3)), zorder=8)
         self.ax.plot(x, y, marker="o", markersize=17, markerfacecolor=COL_STATION,
                      markeredgecolor=COL_STATION_EDGE, markeredgewidth=2.2,
                      linestyle="", zorder=9)
@@ -344,6 +357,10 @@ class TrackCanvas(FigureCanvas):
                                   markerfacecolor=COL_STATION,
                                   markeredgecolor=COL_STATION_EDGE,
                                   color=COL_STATION, label="Station de charge"))
+            if self._station_heading is not None:
+                handles.append(Line2D([], [], color=COL_STATION_EDGE,
+                                      linestyle=(0, (6, 3)), linewidth=2.0,
+                                      label="Axe d'accostage"))
         handles.append(Line2D([], [], marker="o", linestyle="", color=COL_ROBOT,
                               label="Robot (flèche = sens d'avancement)"))
         if analysis:
@@ -363,7 +380,8 @@ class TrackCanvas(FigureCanvas):
     def plot_track(self, points: list[TrackPoint], filter_outliers: bool = True,
                    station_intervals=None, zone_intervals=None,
                    magnetic_intervals=None, station_xy=None,
-                   show_forbidden: bool = True, show=None, all_points=None):
+                   station_heading=None, show_forbidden: bool = True,
+                   show=None, all_points=None):
         """`points` : la période affichée (vert franc).
         `all_points` : tout l'historique, qui définit l'étendue de la pelouse
         (vert pâle) — c'est ce contraste qui montre ce qui a été tondu."""
@@ -371,6 +389,7 @@ class TrackCanvas(FigureCanvas):
         self._analysis_start = None
         self._show = show or {}
         self._station = station_xy
+        self._station_heading = station_heading
 
         base = self._filter_points(all_points if all_points else points,
                                    filter_outliers)
@@ -512,6 +531,8 @@ class MainWindow(QMainWindow):
         self._alerts: list = []                       # (ts, diag) erreurs et alertes
         self._alert_ts: list = []                     # leurs dates, pour bisect
         self._alerts_seen: int = 0                    # rencontrées depuis le début
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._on_play_tick)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -588,6 +609,17 @@ class MainWindow(QMainWindow):
         self.btn_timepath.setCheckable(True)
         self.btn_timepath.toggled.connect(self.on_timepath_toggled)
         analysis_bar.addWidget(self.btn_timepath)
+        self.btn_play = QPushButton("▶ Lecture")
+        self.btn_play.setCheckable(True)
+        self.btn_play.setToolTip("Fait défiler tout seul, sans maintenir Espace")
+        self.btn_play.toggled.connect(self.on_play_toggled)
+        analysis_bar.addWidget(self.btn_play)
+        self.combo_speed = QComboBox()
+        for label, mult in (("×1", 1), ("×2", 2), ("×5", 5), ("×10", 10)):
+            self.combo_speed.addItem(label, mult)
+        self.combo_speed.setToolTip("Vitesse de lecture (secondes de log par seconde réelle)")
+        self.combo_speed.currentIndexChanged.connect(self.on_speed_changed)
+        analysis_bar.addWidget(self.combo_speed)
         self.lbl_time = QLabel("")
         self.lbl_time.setStyleSheet(
             "font-size: 17px; font-weight: bold; color: #1565c0; padding-left: 10px;"
@@ -605,8 +637,9 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.lbl_alert)
 
         hint = QLabel(
-            "1. Clic sur la carte : choisir un moment  •  2. « Show time path » puis "
-            "maintenir Espace : le robot avance seconde par seconde (Maj+Espace : reculer)\n"
+            "1. Clic sur la carte : choisir un moment  •  2. « Show time path », puis "
+            "« Lecture » pour dérouler tout seul (×1 à ×10) ou Espace pour avancer "
+            "seconde par seconde (Maj+Espace : reculer)\n"
             "Molette : zoom  •  Glisser : déplacer  •  Double-clic : vue entière"
         )
         hint.setWordWrap(True)
@@ -783,7 +816,45 @@ class MainWindow(QMainWindow):
             self.lbl_time.setText("")
             self.lbl_alert.setVisible(False)
             self.analysis_time = None
+            if self.btn_play.isChecked():
+                self.btn_play.setChecked(False)
             self.refresh_track()
+
+    # ------------------------------------------------------------------
+    # Lecture automatique
+    # ------------------------------------------------------------------
+    def _speed(self) -> int:
+        return self.combo_speed.currentData() or 1
+
+    def on_speed_changed(self):
+        if self._play_timer.isActive():
+            self._play_timer.setInterval(int(1000 / self._speed()))
+
+    def on_play_toggled(self, playing: bool):
+        if playing and not self.btn_timepath.isChecked():
+            # la lecture n'a de sens qu'en mode analyse : on l'active
+            self.btn_timepath.setChecked(True)
+            if not self.btn_timepath.isChecked():   # refusé faute de logs
+                self.btn_play.setChecked(False)
+                return
+        if playing:
+            self.btn_play.setText("⏸ Pause")
+            self._play_timer.start(int(1000 / self._speed()))
+        else:
+            self.btn_play.setText("▶ Lecture")
+            self._play_timer.stop()
+
+    def _on_play_tick(self):
+        """Une seconde de log par battement : la vitesse choisie règle la
+        cadence, pas la taille du pas, pour ne franchir aucun incident."""
+        if self.analysis_time is None or not self.canvas._pts:
+            self.btn_play.setChecked(False)
+            return
+        if self.analysis_time >= self.canvas._pts[-1].ts:
+            self.btn_play.setChecked(False)
+            self.statusBar().showMessage("Fin de la période : lecture terminée.")
+            return
+        self.step_analysis(1)
 
     def step_analysis(self, seconds: int):
         if self.analysis_time is None or not self.canvas._pts:
@@ -953,8 +1024,13 @@ class MainWindow(QMainWindow):
 
         self._station_intervals, self._zone_intervals = path_intervals(s.lines)
         self._magnetic_intervals = magnetic_intervals(s.lines)
-        # en RTK2 la station est donnée par les logs ; sinon on la déduit
+        # en RTK2 la station et son axe sont donnés par les logs ; en RTK1 on
+        # les déduit des passages en charge
         self._station_xy = s.station_xy or station_position(s.track, s.lines)
+        self._station_heading = s.station_heading
+        if self._station_heading is None:
+            self._station_heading = station_approach(s.track, s.lines,
+                                                     self._station_xy)
 
         # Liste des journées présentes dans la trace
         days = sorted({p.ts.date() for p in s.track if p.ts.year >= 2020})
@@ -1221,6 +1297,7 @@ class MainWindow(QMainWindow):
             zone_intervals=self._zone_intervals,
             magnetic_intervals=self._magnetic_intervals,
             station_xy=self._station_xy,
+            station_heading=self._station_heading,
             show_forbidden=self.chk_forbidden.isChecked(),
             show={
                 "station": self.chk_way_station.isChecked(),

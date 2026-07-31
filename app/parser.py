@@ -72,7 +72,8 @@ class RobotSession:
     lines: list = field(default_factory=list)       # list[LogLine]
     files_loaded: list = field(default_factory=list)
     fmt: str = "rtk1"        # "rtk1" (ancien format) ou "rtk2"
-    station_xy: tuple = None  # station de charge, si les logs la donnent
+    station_xy: tuple = None       # station de charge, si les logs la donnent
+    station_heading: float = None  # cap de l'axe d'accostage, en degrés
 
 
 def _parse_timestamp(s: str) -> Optional[datetime]:

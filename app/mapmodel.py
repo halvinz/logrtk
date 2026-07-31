@@ -16,6 +16,7 @@ Deux choses que les logs ne donnent pas directement mais qu'on peut déduire :
 from __future__ import annotations
 
 import re
+import math
 import bisect
 from collections import deque
 from datetime import datetime, timedelta
@@ -198,6 +199,40 @@ def station_position(points, lines):
     xs = sorted(p.x for p in hits)
     ys = sorted(p.y for p in hits)
     return xs[len(xs) // 2], ys[len(ys) // 2]
+
+
+def station_approach(points, lines, station, max_dist=8.0):
+    """Cap de l'axe d'accostage quand les logs ne le donnent pas (RTK1) :
+    on relève par où le robot arrive dans les secondes qui précèdent la mise
+    en charge. Renvoie un cap en degrés, ou None si on manque de passages.
+    """
+    if not points or not station:
+        return None
+    sx, sy = station
+    times = [p.ts for p in points]
+    bearings = []
+    for l in lines:
+        if l.ts is None or l.ts.year < MIN_VALID_YEAR:
+            continue
+        state = extract_state(l.raw)
+        if not state or not any(state.startswith(s) for s in ARRIVE_STATES):
+            continue
+        for back in (5, 10, 20):
+            i = bisect.bisect_left(times, l.ts - timedelta(seconds=back))
+            if not (0 <= i < len(points)):
+                continue
+            p = points[i]
+            dist = math.hypot(p.x - sx, p.y - sy)
+            if 0.5 < dist < max_dist:
+                bearings.append(math.atan2(p.y - sy, p.x - sx))
+    if len(bearings) < 2:
+        return None
+    # moyenne circulaire : une simple moyenne se tromperait autour de ±180°
+    mx = sum(math.cos(b) for b in bearings) / len(bearings)
+    my = sum(math.sin(b) for b in bearings) / len(bearings)
+    if mx == 0 and my == 0:
+        return None
+    return math.degrees(math.atan2(my, mx))
 
 
 def classify_points(points, station_intervals, zone_intervals,
