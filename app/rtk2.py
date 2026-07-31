@@ -71,6 +71,8 @@ def is_useful_member(name: str) -> bool:
     in_map = name.startswith("map/") or "/map/" in name
     if not in_map:
         return False
+    if base == "anchor_rtk_info.txt":
+        return True
     # descripteurs de carte + l'image de carte du robot. Surtout pas les
     # centaines de captures de log/csvLog, qui ne servent à rien ici.
     return base.endswith((".yaml", ".json")) or base == "time_map.png"
@@ -226,6 +228,54 @@ def read_map_image(folder: str):
     return arr > 0, resolution
 
 
+def read_geo_anchor(folder: str):
+    """Ancrage GPS de la carte, lu dans map/pose_graph/anchor_rtk_info.txt.
+
+    Le fichier donne le point d'origine (originlla) et la matrice de passage
+    entre le repère de la carte et celui du RTK, dont on tire la rotation
+    par rapport au nord.
+
+    Renvoie (latitude, longitude, rotation en degrés) ou None.
+
+    Attention : le fichier liste trois nombres sans les nommer. Sur les
+    exports observés, le second vaut 47,29 et le premier 0,16 pour un robot
+    dont le fuseau est Europe/Paris : c'est donc (longitude, latitude,
+    altitude) malgré le nom « lla ». Les coordonnées sont affichées dans
+    l'application pour qu'une erreur saute aux yeux.
+    """
+    path = os.path.join(folder, "map", "pose_graph", "anchor_rtk_info.txt")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        return None
+
+    m = re.search(r"originlla:\s*\n\s*(-?0x[0-9a-f]+)\s+([\d.]+)\s+"
+                  r"(-?0x[0-9a-f]+)\s+([\d.]+)", text, re.I)
+    if not m:
+        return None
+
+    def value(hex_part, frac):
+        n = int(hex_part, 16)
+        v = abs(n) + float(frac)
+        return -v if hex_part.startswith("-") else v
+
+    lon = value(m.group(1), m.group(2))
+    lat = value(m.group(3), m.group(4))
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+
+    rotation = 0.0
+    rot = re.search(r"T_map_origin_to_anchor_rtk_:\s*\n\s*(-?[\d.]+)\s+(-?[\d.]+)",
+                    text)
+    if rot:
+        cos_a, sin_a = float(rot.group(1)), -float(rot.group(2))
+        rotation = math.degrees(math.atan2(sin_a, cos_a))
+    return lat, lon, rotation
+
+
 def read_identity(folder: str, session) -> None:
     """Modèle et numéro de série : l'export ne contient pas d'en-tête comme
     en RTK1, mais le nom du dossier suit le motif MODELE_SERIE_date."""
@@ -254,4 +304,5 @@ def load(folder: str, session) -> None:
         parse_file(path, session)
     session.station_xy, session.station_heading = read_station(root)
     session.robot_map = read_map_image(root)
+    session.geo_anchor = read_geo_anchor(root)
     read_identity(root, session)

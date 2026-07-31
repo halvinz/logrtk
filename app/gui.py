@@ -21,6 +21,7 @@ import re
 import sys
 import math
 import bisect
+import webbrowser
 from datetime import datetime, time, timedelta
 
 from PySide6.QtCore import Qt, QEvent, QTimer
@@ -43,6 +44,7 @@ from parser import (load_session_from_folder, load_session,
                     load_session_from_archive, RobotSession, TrackPoint)
 from logbible import (analyze_line, analyze_rtk2_line, normalize,
                       robot_categories, search_terms, SEARCH_CATALOG)
+from geoexport import Georef, build_kml, maps_url
 from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       extract_state, magnetic_intervals, station_position,
                       station_approach, build_grid, rasterize,
@@ -488,7 +490,8 @@ class TrackCanvas(FigureCanvas):
             zorder=7
         )
         self._make_robot_artists()
-        self._legend(analysis=False)
+        if self._show.get("legend", True):
+            self._legend(analysis=False)
         self.reset_view()
         self._update_robot(self._pts[-1])
         self.draw()
@@ -518,9 +521,9 @@ class TrackCanvas(FigureCanvas):
         """Passe la carte en mode analyse : zone estompée, le chemin du robot
         se dessinera en bleu à partir de `start` (le zoom courant est gardé).
 
-        `alerts` : liste de (date, gravité) marquées à l'endroit où le robot
-        se trouvait. À la vitesse de répétition du clavier, la bannière seule
-        défilerait trop vite : ces repères montrent où regarder.
+        `alerts` : (date, gravité) des incidents. Ils ne sont marqués que si
+        la case correspondante est cochée — sur un terrain chargé, les croix
+        masquent le tracé qu'on cherche justement à suivre.
         """
         if not self._pts:
             return
@@ -533,7 +536,8 @@ class TrackCanvas(FigureCanvas):
         (self._trail,) = self.ax.plot([], [], color=COL_PATH, linewidth=2.5,
                                       solid_capstyle="round", zorder=5)
         self._make_robot_artists()
-        self._legend(analysis=True)
+        if self._show.get("legend", True):
+            self._legend(analysis=True)
         self.ax.set_xlim(xlim)
         self.ax.set_ylim(ylim)
         self.draw()
@@ -652,16 +656,38 @@ class MainWindow(QMainWindow):
         self.chk_way_station = QCheckBox("Chemin station")
         self.chk_way_magnet = QCheckBox("Bande magnétique")
         self.chk_way_zone = QCheckBox("Chemin entre zones")
+        self.chk_legend = QCheckBox("Légende")
+        self.chk_alerts = QCheckBox("Croix des incidents")
+        self.chk_alerts.setToolTip(
+            "Repères des incidents pendant « Show time path ».\n"
+            "Décochez si elles masquent le tracé."
+        )
         self.chk_robot_map = QCheckBox("Carte du robot")
         self.chk_robot_map.setToolTip(
             "Contour réel enregistré par le robot, quand l'export le contient.\n"
             "Décochez pour revenir au terrain déduit des déplacements."
         )
         for chk in (self.chk_robot_map, self.chk_forbidden, self.chk_way_station,
-                    self.chk_way_magnet, self.chk_way_zone):
+                    self.chk_way_magnet, self.chk_way_zone, self.chk_legend):
             chk.setChecked(True)
             chk.stateChanged.connect(self.refresh_track)
             layer_bar.addWidget(chk)
+        # les croix encombrent plus qu'elles n'aident : masquées par défaut
+        self.chk_alerts.setChecked(False)
+        self.chk_alerts.stateChanged.connect(self.refresh_track)
+        layer_bar.addWidget(self.chk_alerts)
+
+        self.btn_kml = QPushButton("Exporter vers Google Earth…")
+        self.btn_kml.setToolTip(
+            "Enregistre un fichier .kml à ouvrir dans Google Earth ou à "
+            "importer dans Google My Maps : le tracé s'affiche alors par-dessus "
+            "la vue satellite."
+        )
+        self.btn_kml.clicked.connect(self.on_export_kml)
+        layer_bar.addWidget(self.btn_kml)
+        self.btn_maps = QPushButton("Voir sur Google Maps")
+        self.btn_maps.clicked.connect(self.on_open_maps)
+        layer_bar.addWidget(self.btn_maps)
         layer_bar.addStretch(1)
         root.addLayout(layer_bar)
 
@@ -1224,7 +1250,71 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _alert_marks(self) -> list:
         """(date, gravité) des incidents, pour les repérer sur la carte."""
+        if not self.chk_alerts.isChecked():
+            return []
         return [(ts, d["severity"]) for ts, d in self._alerts]
+
+    # ------------------------------------------------------------------
+    # Superposition sur une vue aérienne
+    # ------------------------------------------------------------------
+    def _georef(self):
+        """Repère GPS de la carte, ou None avec un message d'explication."""
+        anchor = self.session.geo_anchor if self.session else None
+        if not anchor:
+            QMessageBox.information(
+                self, "Pas d'ancrage GPS",
+                "Ces logs ne contiennent pas le point d'ancrage GPS de la "
+                "carte (map/pose_graph/anchor_rtk_info.txt).\n\n"
+                "Impossible de situer le terrain sur une vue aérienne."
+            )
+            return None
+        return Georef(anchor[0], anchor[1], anchor[2])
+
+    def on_export_kml(self):
+        georef = self._georef()
+        if georef is None:
+            return
+        if not self.session.track:
+            QMessageBox.information(self, "Rien à exporter",
+                                    "Ces logs ne contiennent aucune position.")
+            return
+        default = "-".join(filter(None, ("tonte", self.session.model)))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Enregistrer la superposition", f"{default}.kml",
+            "Google Earth (*.kml)"
+        )
+        if not path:
+            return
+        start = self.dt_start.dateTime().toPython()
+        end = self.dt_end.dateTime().toPython()
+        pts = [p for p in self.session.track if start <= p.ts <= end]
+        zones = zones_of_points(pts, self._zone_timeline)
+        kml = build_kml(pts, zones, station=self._station_xy, georef=georef,
+                        title=f"Tonte {self.session.model or 'robot'}")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(kml)
+        except OSError as e:
+            QMessageBox.critical(self, "Erreur", f"Écriture impossible :\n{e}")
+            return
+        QMessageBox.information(
+            self, "Superposition enregistrée",
+            f"Fichier créé :\n{path}\n\nOuvrez-le dans Google Earth, ou "
+            "importez-le dans Google My Maps (Créer une carte → Importer) "
+            "pour le voir par-dessus la vue satellite."
+        )
+
+    def on_open_maps(self):
+        georef = self._georef()
+        if georef is None:
+            return
+        url = maps_url(georef, self.session.track)
+        lat, lon = georef.lat, georef.lon
+        QApplication.clipboard().setText(url)
+        webbrowser.open(url)
+        self.statusBar().showMessage(
+            f"Terrain situé à {lat:.6f}, {lon:.6f} — lien copié dans le presse-papiers."
+        )
 
     def _alerts_between(self, t0: datetime, t1: datetime) -> list:
         """Incidents franchis en passant de `t0` à `t1`. L'intervalle est
@@ -1407,6 +1497,7 @@ class MainWindow(QMainWindow):
                 "station": self.chk_way_station.isChecked(),
                 "magnet": self.chk_way_magnet.isChecked(),
                 "zone": self.chk_way_zone.isChecked(),
+                "legend": self.chk_legend.isChecked(),
             },
         )
         cov = self.canvas.coverage()

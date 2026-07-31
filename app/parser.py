@@ -75,6 +75,7 @@ class RobotSession:
     station_xy: tuple = None       # station de charge, si les logs la donnent
     station_heading: float = None  # cap de l'axe d'accostage, en degrés
     robot_map: tuple = None        # (masque de la carte du robot, résolution m)
+    geo_anchor: tuple = None       # (latitude, longitude, rotation°) de l'origine
 
 
 def _parse_timestamp(s: str) -> Optional[datetime]:
