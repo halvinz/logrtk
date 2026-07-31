@@ -59,6 +59,27 @@ def behaviour(states) -> dict:
     return out
 
 
+def _batterie_filaire(session) -> list:
+    """Tension et température relevées dans les journaux filaires, que les
+    robots RTK ne publient pas."""
+    from wired import battery_readings
+
+    from wired import VOLT_MIN
+
+    volts, temps = battery_readings(session.lines)
+    lignes = []
+    if volts:
+        faibles = sum(1 for v in volts if v < VOLT_MIN)
+        volts.sort()
+        detail = (f", dont {faibles} sous {VOLT_MIN:.0f} V" if faibles else "")
+        lignes.append(f"Batterie : {volts[0]:.2f} à {volts[-1]:.2f} V "
+                      f"({len(volts)} relevés{detail})")
+    if temps:
+        temps.sort()
+        lignes.append(f"Température : {temps[0]:.1f} à {temps[-1]:.1f} °C")
+    return lignes
+
+
 _RE_FREQ = re.compile(r"freq:\[(\d+)\]")
 
 
@@ -135,6 +156,8 @@ def describe(session, events, states, coverage=None, periode=None) -> tuple:
     if b["charges"]:
         lignes.append(f"Station : {_plural(b['charges'], 'mise')} en charge, "
                       f"{_plural(b['sorties'], 'sortie')} de base")
+    if session and session.fmt == "wired":
+        lignes.extend(_batterie_filaire(session))
     planning = _frequence(session)
     if planning:
         lignes.append(f"Planning : {planning}")
@@ -177,6 +200,27 @@ def _conclure(session, events, b, n_rtk, n_patine, n_choc, n_blocage):
         if heures < 0.25:
             return ""
         return f", soit {n / heures:.0f} par heure de tonte"
+
+    # Robots filaires : pas de position, la conclusion vient des codes E
+    if session is not None and getattr(session, "fmt", "") == "wired":
+        n_charge = _compte(events, "Batterie", "error", episodes=True)
+        n_fil = _compte(events, "Navigation", "error", episodes=True)
+        n_piege = _compte(events, "Blocage / échappement", episodes=True)
+        if n_charge >= 3:
+            return (f"La recharge échoue régulièrement ({n_charge} épisodes, "
+                    "code E7) : nettoyer les broches du robot et de la "
+                    "station, contrôler le chargeur et la batterie."), "error"
+        if n_fil >= 3:
+            return (f"Le fil périmétrique est perdu régulièrement "
+                    f"({n_fil} épisodes, code E1) : contrôler le câble, ses "
+                    "connecteurs et sa résistance."), "error"
+        if n_piege >= 10:
+            return (f"Le robot se bloque souvent ({n_piege} épisodes, "
+                    "code E4) : chercher les trous et obstacles du terrain."), "warn"
+        pire = _pire(events)
+        if pire:
+            return f"Point principal : {pire[2]['meaning']}.", pire[2]["severity"]
+        return "Aucun problème majeur relevé sur cette période.", "ok"
 
     if positions == 0:
         # inutile de citer « ne se localise pas » comme cause de l'absence de

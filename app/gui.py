@@ -41,7 +41,10 @@ from matplotlib.lines import Line2D
 from matplotlib.colors import ListedColormap
 
 from parser import (load_session_from_folder, load_session,
-                    load_session_from_archive, RobotSession, TrackPoint)
+                    load_session_from_archive, load_session_from_html,
+                    RobotSession, TrackPoint)
+from wired import (looks_like_wired, analyze_wired_line,
+                   state_timeline as wired_states)
 from logbible import (analyze_line, analyze_rtk2_line, normalize,
                       robot_categories, search_terms, SEARCH_CATALOG)
 from geoexport import Georef, build_kml, maps_url
@@ -1272,9 +1275,20 @@ class MainWindow(QMainWindow):
     def on_open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Choisir un ou plusieurs fichiers de logs", "",
-            "Fichiers logs (*.log *.txt);;Tous les fichiers (*)"
+            "Fichiers logs (*.log *.txt *.html);;Tous les fichiers (*)"
         )
         if not files:
+            return
+
+        # Un journal de robot filaire est une page HTML autonome
+        if len(files) == 1 and looks_like_wired(files[0]):
+            try:
+                self.session = load_session_from_html(files[0])
+            except Exception as e:
+                QMessageBox.critical(self, "Erreur",
+                                     f"Impossible de lire ce journal :\n{e}")
+                return
+            self._after_load(os.path.basename(files[0]))
             return
 
         main = pos = path = boot = dmesg = None
@@ -1440,7 +1454,10 @@ class MainWindow(QMainWindow):
                 state = found
             if not (start <= l.ts <= end):
                 continue
-            diag = analyze_line(l.raw, precedent)
+            if self.session.fmt == "wired":
+                diag = analyze_wired_line(l.level, l.text)
+            else:
+                diag = analyze_line(l.raw, precedent)
             if diag is None and self.session.fmt == "rtk2":
                 # pas de bible pour ce modèle : on se fie à la gravité que
                 # le robot inscrit lui-même dans ses journaux
@@ -1644,8 +1661,10 @@ class MainWindow(QMainWindow):
         """Remplit l'encadré de synthèse en tête du diagnostic."""
         if not self.session:
             return
+        etats = (wired_states if self.session.fmt == "wired"
+                 else state_timeline)(self.session.lines)
         lignes, conclusion, gravite = describe(
-            self.session, events, state_timeline(self.session.lines),
+            self.session, events, etats,
             self.canvas.coverage(),
             periode=(self.dt_start.dateTime().toPython(),
                      self.dt_end.dateTime().toPython()),

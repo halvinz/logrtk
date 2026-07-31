@@ -190,6 +190,16 @@ def load_session(main=None, pos=None, path=None, boot=None, dmesg=None) -> Robot
     return session
 
 
+def load_session_from_html(path: str) -> RobotSession:
+    """Journal HTML d'un robot filaire."""
+    import wired
+
+    session = RobotSession()
+    wired.load(path, session)
+    session.lines.sort(key=lambda l: (l.ts is None, l.ts))
+    return session
+
+
 def load_session_from_folder(folder: str) -> RobotSession:
     """Charge un dossier de logs, quel que soit le format du robot."""
     import rtk2
