@@ -676,12 +676,19 @@ class MainWindow(QMainWindow):
         self.btn_open_portal.clicked.connect(self.on_open_portal)
         self.btn_open_files = QPushButton("Ouvrir des fichiers…")
         self.btn_open_files.clicked.connect(self.on_open_files)
+        self.btn_reset = QPushButton("Tout réinitialiser")
+        self.btn_reset.setToolTip(
+            "Efface les logs, la carte, l'état du portail et le diagnostic\n"
+            "pour repartir sur une autre machine."
+        )
+        self.btn_reset.clicked.connect(self.on_reset)
         self.lbl_loaded = QLabel("Aucun fichier chargé.")
         top_bar.addWidget(self.btn_open_folder)
         top_bar.addWidget(self.btn_open_zip)
         top_bar.addWidget(self.btn_open_plm)
         top_bar.addWidget(self.btn_open_portal)
         top_bar.addWidget(self.btn_open_files)
+        top_bar.addWidget(self.btn_reset)
         top_bar.addWidget(self.lbl_loaded, stretch=1)
         root.addLayout(top_bar)
 
@@ -1189,6 +1196,89 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Erreur", f"Impossible de lire ce dossier :\n{e}")
             return
         self._after_load(folder)
+
+    def on_reset(self):
+        """Repart de zéro pour diagnostiquer une autre machine.
+
+        Tout doit être remis à plat : un reste de la session précédente —
+        carte, état portail, diagnostic — se mêlerait aux données du robot
+        suivant sans que rien ne le signale.
+        """
+        if self.session and not self._confirmer_reset():
+            return
+
+        # lecture en cours
+        if self.btn_play.isChecked():
+            self.btn_play.setChecked(False)
+        if self.btn_timepath.isChecked():
+            self.btn_timepath.setChecked(False)
+        self._play_timer.stop()
+
+        # données chargées
+        self.session = None
+        self._plm_map = None
+        self._portal = None
+        self._manual_anchor = None
+        self._station_intervals = []
+        self._zone_intervals = []
+        self._magnetic_intervals = []
+        self._zone_timeline = []
+        self._station_xy = None
+        self._station_heading = None
+        self._diag_events = []
+        self._alerts = []
+        self._alert_ts = []
+        self._alerts_seen = 0
+        self.analysis_start = None
+        self.analysis_time = None
+
+        # carte
+        self.canvas._plm = None
+        self.canvas._robot_map = None
+        self.canvas.plot_track([])
+
+        # bandeau du haut et filtres
+        self.lbl_loaded.setText("Aucun fichier chargé.")
+        self.lbl_loaded.setToolTip("")
+        self.combo_day.blockSignals(True)
+        self.combo_day.clear()
+        self.combo_day.addItem("Toute la période")
+        self.combo_day.blockSignals(False)
+        self.combo_source.blockSignals(True)
+        self.combo_source.clear()
+        self.combo_source.addItem("Tous fichiers")
+        self.combo_source.blockSignals(False)
+        self.combo_level.setCurrentIndex(0)
+        self.txt_search.clear()
+
+        # onglets
+        for etiquette in (self.lbl_model, self.lbl_serial, self.lbl_firmware,
+                          self.lbl_export_date, self.lbl_battery, self.lbl_blade,
+                          self.lbl_worktime, self.lbl_distance, self.lbl_boundary):
+            etiquette.setText("-")
+        self.txt_schedule.clear()
+        self.list_logs.clear()
+        self.list_diag.clear()
+        self.txt_summary.clear()
+        self.txt_diag_search.clear()
+        self.lbl_diag.setText("")
+        self.txt_client.clear()
+        self.txt_assistant.clear()
+        self.lbl_time.setText("")
+        self.lbl_alert.setVisible(False)
+        self.tabs.setTabText(self.tabs.indexOf(self.diag_widget), "Diagnostic")
+
+        self.statusBar().showMessage(
+            "Tout est effacé : ouvrez les logs d'une autre machine.")
+
+    def _confirmer_reset(self) -> bool:
+        boutons = QMessageBox.StandardButton
+        return QMessageBox.question(
+            self, "Tout réinitialiser",
+            "Effacer les logs chargés, la carte, l'état du portail et le "
+            "diagnostic en cours ?",
+            boutons.Yes | boutons.No, boutons.No
+        ) == boutons.Yes
 
     def on_open_zip(self):
         path, _ = QFileDialog.getOpenFileName(
