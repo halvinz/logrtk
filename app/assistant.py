@@ -36,12 +36,13 @@ def _norm(texte: str) -> str:
 # --------------------------------------------------------------------------
 # Familles de robots, d'après la référence citée dans le message
 # --------------------------------------------------------------------------
-# Séries observées : 1xx filaires, 16x/17x/23x RTK première génération,
-# 24x et au-delà RTK deuxième génération.
+# Découpage des séries confirmé par le service : filaires de KR100 à KR130,
+# RTK première génération en 16x, 17x, 23x et 24x, RTK deuxième génération
+# à partir de KR25x.
 FAMILLES = [
-    (r"kr\s?1[0-2]\d", "filaire"),
-    (r"kr\s?(16|17|23)\d", "rtk1"),
-    (r"kr\s?2[4-9]\d", "rtk2"),
+    (r"kr\s?1[0-3]\d", "filaire"),
+    (r"kr\s?(16|17|23|24)\d", "rtk1"),
+    (r"kr\s?2[5-9]\d", "rtk2"),
     (r"\brtk\s?2\b|\bseconde generation\b", "rtk2"),
     (r"\brtk\b", "rtk1"),
     (r"\bfilaire\b|\bperimetrique\b", "filaire"),
@@ -368,6 +369,57 @@ def _mise_hors_cause(texte_norm: str) -> set:
     return hors
 
 
+# Mots trop courants pour distinguer un cas d'un autre
+_VIDES = {"robot", "tondeuse", "client", "probleme", "solution", "cause",
+          "pour", "dans", "avec", "elle", "cette", "être", "etre", "faire",
+          "plus", "pas", "que", "qui", "sur", "les", "des", "une", "est",
+          "son", "sa", "ses", "vous", "nous", "leur", "bien", "tout", "tous",
+          "peut", "faut", "voir", "puis", "mais", "par", "aux", "car"}
+
+
+def _mots(texte: str) -> set:
+    return {m for m in re.findall(r"[a-z0-9]{3,}", _norm(texte))
+            if m not in _VIDES}
+
+
+def chercher_cas(message: str, famille: str = "", limite: int = 5) -> list:
+    """Cas de la base de dépannage qui ressemblent le plus au message.
+
+    Comparaison par mots communs : la base est écrite dans la langue des
+    techniciens, la même que celle des clients, ce qui suffit à rapprocher
+    « il ne rentre pas à sa base » de « Robot ne rentre pas à sa base ».
+    """
+    try:
+        from base_aide import CAS
+    except ImportError:
+        return []
+
+    mots_message = _mots(message)
+    if not mots_message:
+        return []
+
+    resultats = []
+    for titre, fam, corps in CAS:
+        if fam and famille and fam != famille:
+            continue
+        # Le document source colle parfois les mots (« Lesultrasonsne
+        # fonctionnentplus ») : on cherche donc le mot dans la chaîne plutôt
+        # que dans une liste de jetons.
+        titre_norm, corps_norm = _norm(titre), _norm(corps)
+        communs_titre = {m for m in mots_message if m in titre_norm}
+        communs_corps = {m for m in mots_message if m in corps_norm}
+        # le titre décrit le symptôme : il pèse davantage que le corps
+        score = 3 * len(communs_titre) + len(communs_corps)
+        if fam == famille and famille:
+            score += 1
+        # au moins deux mots du symptôme en commun : en dessous, on remonte
+        # des cas sans rapport
+        if score >= 6 and len(communs_titre) >= 2:
+            resultats.append((score, titre, fam, corps))
+    resultats.sort(key=lambda r: -r[0])
+    return resultats[:limite]
+
+
 def analyser(message: str, session=None, events=None) -> dict:
     """Diagnostic structuré. `events` : incidents regroupés du diagnostic."""
     bas = _norm(message)
@@ -399,6 +451,7 @@ def analyser(message: str, session=None, events=None) -> dict:
         "famille": famille,
         "reference": reference,
         "symptomes": releves,
+        "cas_similaires": chercher_cas(message, famille),
         "deja_fait": _deja_traite(bas),
         "hors_cause": hors_cause,
         "journaux_charges": bool(session and session.lines),
@@ -419,7 +472,7 @@ def rediger(rapport: dict) -> str:
                    "la référence (KR101E, KR172E, KR260ES…) pour un "
                    "diagnostic adapté à la gamme.</p>")
 
-    if not rapport["symptomes"]:
+    if not rapport["symptomes"] and not rapport.get("cas_similaires"):
         out.append("<p>Aucun symptôme connu n'a été reconnu dans ce message. "
                    "Reformulez-le ou citez le code d'erreur affiché.</p>")
         return "".join(out)
@@ -460,6 +513,16 @@ def rediger(rapport: dict) -> str:
     if rapport["hors_cause"]:
         out.append("<p><b>Pistes écartées par les essais du client :</b> "
                    + ", ".join(sorted(rapport["hors_cause"])) + ".</p>")
+
+    cas = rapport.get("cas_similaires") or []
+    if cas:
+        out.append("<p style='margin-top:10px'><b>Cas déjà résolus dans la "
+                   "base de dépannage</b></p><ul>")
+        for _score, titre, fam, corps in cas:
+            marque = f" <i>({NOM_FAMILLE.get(fam, fam)})</i>" if fam else ""
+            out.append(f"<li><b>{titre}</b>{marque}<br>"
+                       f"<span style='color:#555'>{corps}</span></li>")
+        out.append("</ul>")
 
     out.append(_conclusion(rapport))
     return "".join(out)
