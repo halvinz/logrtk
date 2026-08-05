@@ -56,6 +56,9 @@ from mapmodel import (path_intervals, classify_points, forbidden_zones,
                       zone_timeline, zones_of_points, state_timeline)
 from summary import describe
 from assistant import analyser, rediger
+# Import en tête (et non dans la fonction) : c'est ce qui garantit que
+# PyInstaller embarque digest.py dans le .exe.
+from digest import render as build_ai_digest
 
 # Fenêtre de regroupement des événements identiques dans l'onglet Diagnostic
 GROUP_SECONDS = 120
@@ -645,6 +648,7 @@ class MainWindow(QMainWindow):
         self._portal = None                           # état MQTT du portail
         self._station_xy = None                       # position réelle de la station
         self._diag_events: list = []                  # diagnostic déjà calculé
+        self._source_path: str = ""                   # dossier/fichier chargé
         self._alerts: list = []                       # (ts, diag) erreurs et alertes
         self._alert_ts: list = []                     # leurs dates, pour bisect
         self._alerts_seen: int = 0                    # rencontrées depuis le début
@@ -937,6 +941,20 @@ class MainWindow(QMainWindow):
         diag_bar.addWidget(self.chk_diag_group)
         self.lbl_diag = QLabel("")
         diag_bar.addWidget(self.lbl_diag, stretch=1)
+        # Condensé destiné à une IA : le journal complet est trop volumineux
+        # pour être collé tel quel dans ChatGPT ou Claude.
+        self.btn_digest_copy = QPushButton("Copier le condensé IA")
+        self.btn_digest_copy.setToolTip(
+            "Résume tout le journal en quelques pages (incidents regroupés, "
+            "erreurs inconnues, chronologie) et le met dans le presse-papier :\n"
+            "il n'y a plus qu'à le coller dans ChatGPT, Claude ou autre."
+        )
+        self.btn_digest_copy.clicked.connect(self.on_digest_copy)
+        diag_bar.addWidget(self.btn_digest_copy)
+        self.btn_digest_save = QPushButton("Enregistrer…")
+        self.btn_digest_save.setToolTip("Enregistre ce même condensé en fichier .md")
+        self.btn_digest_save.clicked.connect(self.on_digest_save)
+        diag_bar.addWidget(self.btn_digest_save)
         diag_layout.addLayout(diag_bar)
         self.list_diag = QListWidget()
         self.list_diag.setStyleSheet("font-size: 12px;")
@@ -1438,6 +1456,7 @@ class MainWindow(QMainWindow):
 
         # Seulement ce qui a été ouvert : le détail des journaux lus encombrait
         # la barre. Il reste consultable en infobulle.
+        self._source_path = source_label      # sert à nommer le condensé IA
         self.lbl_loaded.setText(f"Chargé : {source_label}")
         self.lbl_loaded.setToolTip(
             f"{len(s.files_loaded)} journaux lus :\n" + "\n".join(sorted(s.files_loaded))
@@ -1653,6 +1672,58 @@ class MainWindow(QMainWindow):
             return None
         self._manual_anchor = (lat, lon, rot)
         return Georef(lat, lon, rot)
+
+    # ------------------------------------------------------------------
+    # Condensé pour analyse par une IA
+    # ------------------------------------------------------------------
+    def _build_digest(self):
+        """Texte du condensé, ou None si rien à condenser."""
+        if not self.session or not self.session.lines:
+            QMessageBox.information(
+                self, "Rien à condenser",
+                "Ouvrez d'abord un dossier de logs."
+            )
+            return None
+        # Plusieurs centaines de milliers de lignes à relire : l'interface
+        # se fige une poignée de secondes, autant l'annoncer.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            return build_ai_digest(self.session, self._source_path or "logs")
+        except Exception as e:                       # noqa: BLE001
+            QMessageBox.critical(self, "Erreur", f"Condensé impossible :\n{e}")
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def on_digest_copy(self):
+        texte = self._build_digest()
+        if texte is None:
+            return
+        QApplication.clipboard().setText(texte)
+        QMessageBox.information(
+            self, "Condensé copié",
+            f"{len(texte)} caractères copiés dans le presse-papier.\n\n"
+            "Collez-les dans ChatGPT, Claude ou l'assistant de votre choix : "
+            "la question à poser est déjà écrite à la fin du texte."
+        )
+
+    def on_digest_save(self):
+        texte = self._build_digest()
+        if texte is None:
+            return
+        default = "-".join(filter(None, ("condense", self.session.model)))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Enregistrer le condensé", f"{default}.md", "Markdown (*.md)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(texte)
+        except OSError as e:
+            QMessageBox.critical(self, "Erreur", f"Écriture impossible :\n{e}")
+            return
+        QMessageBox.information(self, "Condensé enregistré", f"Fichier créé :\n{path}")
 
     def on_export_kml(self):
         georef = self._georef()

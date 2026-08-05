@@ -28,8 +28,15 @@ diagnostic) est lui entièrement reconstruit à partir des logs texte.
 ## Condensé pour analyse par IA (`digest.py`)
 
 Un export de tondeuse fait de 40 000 à 800 000 lignes : aucun modèle de
-langage n'analyse correctement ça. `digest.py` en tire un condensé Markdown
+langage n'analyse correctement ça. Le condensé en tire un résumé Markdown
 de quelques pages, à coller dans ChatGPT, Claude ou tout autre assistant.
+
+**Depuis l'application** (donc depuis le .exe) : onglet **Diagnostic**,
+bouton **« Copier le condensé IA »** — le texte part dans le presse-papier,
+il n'y a plus qu'à le coller dans l'assistant. Le bouton
+« Enregistrer… » à côté produit le même contenu en fichier `.md`.
+
+**En ligne de commande** :
 
 ```
 python app/digest.py "C:\chemin\vers\LOGTOOL" -o condense.md
