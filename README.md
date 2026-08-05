@@ -57,6 +57,32 @@ une analyse externe apporte quelque chose.
 Ordres de grandeur constatés : 322 000 lignes → 11 000 caractères,
 770 000 lignes → 12 000 caractères.
 
+## Enrichir la base d'aide depuis un canal Teams (`teams_import.py`)
+
+Les échanges de l'équipe contiennent des diagnostics que `base_aide.py` n'a
+pas encore. Cet outil part du **texte copié-collé** depuis Teams — aucune
+API à faire ouvrir, on ne lit que ce que l'on a déjà le droit de lire — et
+en tire des cas (symptôme, gamme, solution).
+
+```
+python app/teams_import.py canal.txt --preview     # vérifier la lecture
+python app/teams_import.py canal.txt -o cas.csv    # produire le CSV
+python app/teams_import.py canal.txt --python      # tuples prêts à coller
+```
+
+Ce qu'il fait : reconstitue les fils (un échange = un problème + les
+réponses), ne retient que les fils techniques (références `KR###`, codes
+d'erreur, RTK, station, batterie…), écarte politesses et logistique,
+**retire les noms des auteurs**, et écarte les symptômes déjà présents
+dans `base_aide.py`.
+
+Commencer par `--preview` : il annonce le nombre de messages reconnus. Si
+ce nombre est nul ou très bas, c'est que la mise en forme collée diffère de
+celles prévues — le format du presse-papier de Teams varie selon le client.
+
+Le CSV est **à relire avant** d'être versé dans la base : une solution
+fausse dans `base_aide.py` coûte plus cher qu'une solution absente.
+
 ## Utilisation en développement (sans compiler)
 
 ```
