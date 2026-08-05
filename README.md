@@ -25,6 +25,31 @@ décodés ici — le fond de carte (zone verte tondue) n'est donc pas reproduit.
 Le trajet du robot (le tracé bleu/rouge, la donnée la plus utile pour le
 diagnostic) est lui entièrement reconstruit à partir des logs texte.
 
+## Condensé pour analyse par IA (`digest.py`)
+
+Un export de tondeuse fait de 40 000 à 800 000 lignes : aucun modèle de
+langage n'analyse correctement ça. `digest.py` en tire un condensé Markdown
+de quelques pages, à coller dans ChatGPT, Claude ou tout autre assistant.
+
+```
+python app/digest.py "C:\chemin\vers\LOGTOOL" -o condense.md
+python app/digest.py export.zip --max-chars 20000
+```
+
+Il accepte les trois formats (dossier RTK1, dossier ou archive RTK2, page
+HTML filaire) et **ne dépend que de la bibliothèque standard** : il tourne
+avec un simple `python`, sans installer numpy ni PySide6.
+
+Le condensé contient l'identité du robot, ce qu'il a fait, sa conclusion
+locale, les incidents **regroupés en épisodes** (un message répété mille
+fois est un incident, pas mille), un échantillon de lignes brutes par
+incident, la chronologie des états — et surtout la liste des **erreurs que
+la base de diagnostic ne reconnaît pas**, qui est précisément ce sur quoi
+une analyse externe apporte quelque chose.
+
+Ordres de grandeur constatés : 322 000 lignes → 11 000 caractères,
+770 000 lignes → 12 000 caractères.
+
 ## Utilisation en développement (sans compiler)
 
 ```
@@ -47,9 +72,14 @@ Sur une machine Windows avec Python 3.10+ installé (python.org, cocher
 ```
 RobotLogViewer/
 ├── app/
-│   ├── main.py      point d'entrée
+│   ├── main.py       point d'entrée
 │   ├── gui.py        interface (PySide6 + matplotlib)
-│   └── parser.py     analyse des fichiers de logs
+│   ├── parser.py     analyse des fichiers de logs (RTK1)
+│   ├── rtk2.py       exports RTK2, wired.py  robots filaires
+│   ├── logbible.py   base de diagnostic (message → cause)
+│   ├── summary.py    résumé de comportement et conclusion
+│   ├── states.py     machine à états (sans numpy, partagée avec digest)
+│   └── digest.py     condensé Markdown pour analyse par IA (CLI)
 ├── requirements.txt
 ├── build_exe.bat      script de build Windows en un clic
 └── README.md

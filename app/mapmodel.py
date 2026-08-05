@@ -24,11 +24,9 @@ from datetime import datetime, timedelta
 import numpy as np
 
 
-# Le RTC du robot repart en 2017 après certaines coupures : dates à ignorer
-MIN_VALID_YEAR = 2020
-
-_RE_STATE = re.compile(r"Ui_Inter_(Sub_)?WorkMode_(\w+)", re.I)
-_RE_RTK2_STATE = re.compile(r"\[(Work|Charge) State\]\s*\[\d+\]\s*(Enter|Exit)\s+(.+)", re.I)
+# Machine à états : définie dans `states`, qui ne dépend pas de numpy, et
+# ré-exportée ici pour les appelants historiques (gui.py).
+from states import MIN_VALID_YEAR, extract_state, state_timeline  # noqa: F401
 
 # États pendant lesquels le robot circule au lieu de tondre
 DEPART_STATES = {"prestart", "leavebase", "wait_leavebase_result", "return"}
@@ -38,50 +36,6 @@ MOWING_STATES = {"start"}
 # Un trajet station <-> zone dure quelques minutes : au-delà, c'est que le
 # robot stationne (nuit de charge) et non qu'il roule.
 MAX_TRANSIT_SECONDS = 900
-
-
-def extract_state(raw: str) -> str | None:
-    """État du robot déduit d'une ligne de log, sinon None.
-
-    Deux machines à états selon la génération :
-      RTK1  *Ui_Inter_WorkMode_Error# --> *Ui_Inter_WorkMode_PrePowerOff#
-      RTK2  [Work State] [12] Enter Auto   /   [Charge State] [18] Exit Charge Doing
-    Elles sont ramenées au même vocabulaire pour que la détection des
-    trajets fonctionne à l'identique sur les deux formats.
-    """
-    low = raw.lower()
-    if "workmode" in low:
-        found = [name for _sub, name in _RE_STATE.findall(raw)
-                 if name.lower() != "change"]
-        return found[-1].lower() if found else None
-
-    m = _RE_RTK2_STATE.search(raw)
-    if not m:
-        return None
-    kind, action, name = m.group(1).lower(), m.group(2).lower(), m.group(3)
-    name = name.strip().lower().replace(" ", "")
-    if kind == "charge":
-        if name.startswith("chargedoing"):
-            # entrée en charge = arrivée à la station, sortie = départ
-            return "charge" if action == "enter" else "prestart"
-        return None
-    if action != "enter":
-        return None
-    return {"auto": "start", "idle": "idle", "poweroff": "prepoweroff",
-            "manualriding": "idle"}.get(name)
-
-
-def state_timeline(lines) -> list:
-    """[(ts, state_bas_de_casse, is_sub)] à partir des lignes de log."""
-    events = []
-    for l in lines:
-        if l.ts is None or l.ts.year < MIN_VALID_YEAR:
-            continue
-        state = extract_state(l.raw)
-        if state:
-            events.append((l.ts, state, "sub_workmode" in l.raw.lower()))
-    events.sort(key=lambda e: e[0])
-    return events
 
 
 def _merge(intervals, gap_seconds=90):
